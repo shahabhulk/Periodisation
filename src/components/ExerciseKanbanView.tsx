@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
-import { Search, Dumbbell, RefreshCw, Info, Check, Layers, X, Bookmark } from 'lucide-react';
+import { Search, Dumbbell, RefreshCw, Info, Check, Layers, X, Bookmark, Plus, Trash2 } from 'lucide-react';
 import { FALLBACK_EXERCISES } from '../data/exerciseLibraryData';
 
 export interface ExerciseDBItem {
@@ -53,16 +53,50 @@ export const ExerciseKanbanView: React.FC<ExerciseKanbanViewProps> = ({
   onClose,
   onResumeWorkout,
 }) => {
-  const filterFallbackExercises = (s: string, bp: string, eq: string): ExerciseDBItem[] => {
-    return FALLBACK_EXERCISES.filter((ex) => {
-      const matchSearch = !s.trim() || ex.name.toLowerCase().includes(s.toLowerCase());
+  // Persistent Custom Exercises from localStorage
+  const [customExercises, setCustomExercises] = useState<ExerciseDBItem[]>(() => {
+    try {
+      const saved = localStorage.getItem('custom_exercises');
+      return saved ? JSON.parse(saved) : [];
+    } catch (e) {
+      console.error('Failed to parse custom exercises from storage', e);
+      return [];
+    }
+  });
+
+  const [isAddModalOpen, setIsAddModalOpen] = useState(false);
+  const [newExerciseForm, setNewExerciseForm] = useState({
+    name: '',
+    bodyPart: 'chest',
+    equipment: 'barbell',
+    targetMuscle: '',
+    secondaryMuscles: '',
+    gifUrl: '',
+    instructions: '',
+  });
+
+  const filterCombinedExercises = (s: string, bp: string, eq: string, customList = customExercises): ExerciseDBItem[] => {
+    const all = [...customList, ...FALLBACK_EXERCISES];
+    return all.filter((ex) => {
+      const matchSearch =
+        !s.trim() ||
+        ex.name.toLowerCase().includes(s.toLowerCase()) ||
+        ex.targetMuscles?.some((m) => m.toLowerCase().includes(s.toLowerCase()));
       const matchBp = bp === 'all' || ex.bodyParts.includes(bp);
       const matchEq = eq === 'all' || ex.equipments.includes(eq);
       return matchSearch && matchBp && matchEq;
     });
   };
 
-  const [exercises, setExercises] = useState<ExerciseDBItem[]>(() => filterFallbackExercises('', 'all', 'all'));
+  const [exercises, setExercises] = useState<ExerciseDBItem[]>(() => {
+    try {
+      const saved = localStorage.getItem('custom_exercises');
+      const parsed: ExerciseDBItem[] = saved ? JSON.parse(saved) : [];
+      return [...parsed, ...FALLBACK_EXERCISES];
+    } catch (e) {
+      return FALLBACK_EXERCISES;
+    }
+  });
   const [loading, setLoading] = useState(false);
   const [search, setSearch] = useState('');
   const [bodyPart, setBodyPart] = useState('all');
@@ -185,8 +219,18 @@ export const ExerciseKanbanView: React.FC<ExerciseKanbanViewProps> = ({
       if (res.ok) {
         const json = await res.json();
         if (json.success && Array.isArray(json.data) && json.data.length > 0) {
+          const matchingCustom = customExercises.filter((ex) => {
+            const matchSearch =
+              !search.trim() ||
+              ex.name.toLowerCase().includes(search.toLowerCase()) ||
+              ex.targetMuscles?.some((m) => m.toLowerCase().includes(search.toLowerCase()));
+            const matchBp = bodyPart === 'all' || ex.bodyParts.includes(bodyPart);
+            const matchEq = equipment === 'all' || ex.equipments.includes(equipment);
+            return matchSearch && matchBp && matchEq;
+          });
+
           if (reset) {
-            setExercises(json.data);
+            setExercises([...matchingCustom, ...json.data]);
           } else {
             setExercises((prev) => [...prev, ...json.data]);
           }
@@ -204,13 +248,13 @@ export const ExerciseKanbanView: React.FC<ExerciseKanbanViewProps> = ({
     }
 
     // Fallback if API fails or returns no data
-    const fallbackList = filterFallbackExercises(search, bodyPart, equipment);
+    const fallbackList = filterCombinedExercises(search, bodyPart, equipment, customExercises);
     if (reset) {
       setExercises(fallbackList);
     } else {
       setExercises((prev) => {
-        const existingIds = new Set(prev.map(p => p.exerciseId));
-        const newItems = fallbackList.filter(f => !existingIds.has(f.exerciseId));
+        const existingIds = new Set(prev.map((p) => p.exerciseId));
+        const newItems = fallbackList.filter((f) => !existingIds.has(f.exerciseId));
         return [...prev, ...newItems];
       });
     }
@@ -220,7 +264,7 @@ export const ExerciseKanbanView: React.FC<ExerciseKanbanViewProps> = ({
 
   useEffect(() => {
     // Immediately filter local exercises for crisp UI responsiveness
-    setExercises(filterFallbackExercises(search, bodyPart, equipment));
+    setExercises(filterCombinedExercises(search, bodyPart, equipment, customExercises));
 
     if (debounceRef.current) clearTimeout(debounceRef.current);
     debounceRef.current = setTimeout(() => {
@@ -230,7 +274,7 @@ export const ExerciseKanbanView: React.FC<ExerciseKanbanViewProps> = ({
     return () => {
       if (debounceRef.current) clearTimeout(debounceRef.current);
     };
-  }, [search, bodyPart, equipment]);
+  }, [search, bodyPart, equipment, customExercises]);
 
   const loadMore = () => {
     if (cursor && !loading) {
@@ -244,6 +288,53 @@ export const ExerciseKanbanView: React.FC<ExerciseKanbanViewProps> = ({
       setAddedSuccessName(ex.name);
       setTimeout(() => setAddedSuccessName(null), 2500);
     }
+  };
+
+  const handleSaveNewExercise = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!newExerciseForm.name.trim()) return;
+
+    const newExercise: ExerciseDBItem = {
+      exerciseId: `custom-${Date.now()}`,
+      name: newExerciseForm.name.trim(),
+      bodyParts: [newExerciseForm.bodyPart],
+      equipments: [newExerciseForm.equipment],
+      targetMuscles: newExerciseForm.targetMuscle ? [newExerciseForm.targetMuscle.trim()] : [newExerciseForm.bodyPart],
+      secondaryMuscles: newExerciseForm.secondaryMuscles
+        ? newExerciseForm.secondaryMuscles.split(',').map((s) => s.trim()).filter(Boolean)
+        : [],
+      gifUrl: newExerciseForm.gifUrl.trim(),
+      instructions: newExerciseForm.instructions
+        ? newExerciseForm.instructions.split('\n').map((s) => s.trim()).filter(Boolean)
+        : ['Perform controlled repetitions with proper technique.'],
+    };
+
+    const updated = [newExercise, ...customExercises];
+    setCustomExercises(updated);
+    localStorage.setItem('custom_exercises', JSON.stringify(updated));
+
+    setNewExerciseForm({
+      name: '',
+      bodyPart: 'chest',
+      equipment: 'barbell',
+      targetMuscle: '',
+      secondaryMuscles: '',
+      gifUrl: '',
+      instructions: '',
+    });
+    setIsAddModalOpen(false);
+
+    setAddedSuccessName(`Created "${newExercise.name}"`);
+    setTimeout(() => setAddedSuccessName(null), 2500);
+  };
+
+  const handleDeleteCustomExercise = (id: string) => {
+    if (!window.confirm('Are you sure you want to remove this custom exercise from your library?')) return;
+
+    const updated = customExercises.filter((ex) => ex.exerciseId !== id);
+    setCustomExercises(updated);
+    localStorage.setItem('custom_exercises', JSON.stringify(updated));
+    setSelectedExerciseModal(null);
   };
 
   return (
@@ -384,6 +475,43 @@ export const ExerciseKanbanView: React.FC<ExerciseKanbanViewProps> = ({
           display: inline-flex;
           align-items: center;
           gap: 4px;
+        }
+
+        .n2-custom-badge {
+          font-size: 9.5px;
+          font-weight: 800;
+          color: #fb7185;
+          background: rgba(244, 63, 94, 0.18);
+          border: 1px solid rgba(244, 63, 94, 0.45);
+          padding: 2px 6px;
+          border-radius: 6px;
+          text-transform: uppercase;
+          letter-spacing: 0.5px;
+          display: inline-flex;
+          align-items: center;
+        }
+
+        .n2-add-btn {
+          background: linear-gradient(135deg, #f43f5e 0%, #e11d48 100%);
+          border: 1px solid #fb7185;
+          color: #ffffff;
+          font-size: 12.5px;
+          font-weight: 700;
+          padding: 7px 13px;
+          border-radius: 10px;
+          display: inline-flex;
+          align-items: center;
+          gap: 6px;
+          cursor: pointer;
+          transition: all 0.2s ease;
+          box-shadow: 0 2px 10px rgba(244, 63, 94, 0.35);
+          white-space: nowrap;
+        }
+
+        .n2-add-btn:hover {
+          filter: brightness(1.1);
+          transform: translateY(-1px);
+          box-shadow: 0 4px 14px rgba(244, 63, 94, 0.5);
         }
 
         .n2-bottom-confirm-bar {
@@ -657,32 +785,45 @@ export const ExerciseKanbanView: React.FC<ExerciseKanbanViewProps> = ({
 
       {/* Top Controls Header & Filters */}
       <div className="n2-top-header">
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '14px' }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '14px', flexWrap: 'wrap', gap: '10px' }}>
           <h1 className="n2-main-title" style={{ margin: 0 }}>
             <Dumbbell className="w-6 h-6 text-rose-500" />
             Exercise Library {totalCount !== null ? `(${totalCount.toLocaleString()} Exercises)` : ''}
           </h1>
-          {onClose && (
+
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
             <button
-              onClick={onClose}
-              style={{
-                background: 'rgba(255, 255, 255, 0.08)',
-                border: '1px solid #2d374e',
-                color: '#ffffff',
-                width: '36px',
-                height: '36px',
-                borderRadius: '10px',
-                display: 'inline-flex',
-                alignItems: 'center',
-                justifyContent: 'center',
-                cursor: 'pointer',
-                transition: 'all 0.2s ease',
-              }}
-              title="Close Exercise Library"
+              type="button"
+              onClick={() => setIsAddModalOpen(true)}
+              className="n2-add-btn"
+              title="Create New Custom Exercise"
             >
-              <X className="w-5 h-5 text-white" />
+              <Plus className="w-4 h-4" />
+              <span>Add Exercise</span>
             </button>
-          )}
+
+            {onClose && (
+              <button
+                onClick={onClose}
+                style={{
+                  background: 'rgba(255, 255, 255, 0.08)',
+                  border: '1px solid #2d374e',
+                  color: '#ffffff',
+                  width: '36px',
+                  height: '36px',
+                  borderRadius: '10px',
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  cursor: 'pointer',
+                  transition: 'all 0.2s ease',
+                }}
+                title="Close Exercise Library"
+              >
+                <X className="w-5 h-5 text-white" />
+              </button>
+            )}
+          </div>
         </div>
 
         <div className="n2-filter-grid">
@@ -763,21 +904,37 @@ export const ExerciseKanbanView: React.FC<ExerciseKanbanViewProps> = ({
                   />
                 </button>
 
-                {isSel && (
-                  <span className="n2-selected-badge">
-                    <Check className="w-3.5 h-3.5" /> Selected
-                  </span>
-                )}
+                <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                  {ex.exerciseId.startsWith('custom-') && (
+                    <span className="n2-custom-badge">Custom</span>
+                  )}
+                  {isSel && (
+                    <span className="n2-selected-badge">
+                      <Check className="w-3.5 h-3.5" /> Selected
+                    </span>
+                  )}
+                </div>
               </div>
 
               {/* Animated GIF Preview graphics */}
               <div className="n2-gif-frame">
-                <img
-                  src={ex.gifUrl}
-                  alt={ex.name}
-                  className="n2-gif-img"
-                  loading="lazy"
-                />
+                {ex.gifUrl ? (
+                  <img
+                    src={ex.gifUrl}
+                    alt={ex.name}
+                    className="n2-gif-img"
+                    loading="lazy"
+                    onError={(e) => {
+                      // Fallback if image URL fails to load
+                      (e.target as HTMLElement).style.display = 'none';
+                    }}
+                  />
+                ) : (
+                  <div style={{ width: '100%', height: '100%', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', background: '#0e131d', color: '#64748b', gap: '6px' }}>
+                    <Dumbbell className="w-8 h-8 text-rose-500/50" />
+                    <span style={{ fontSize: '11px', fontWeight: 600, color: '#94a3b8' }}>Custom Exercise</span>
+                  </div>
+                )}
               </div>
 
               {/* Exercise Name */}
@@ -879,11 +1036,33 @@ export const ExerciseKanbanView: React.FC<ExerciseKanbanViewProps> = ({
 
             <div className="modal-body" style={{ gap: '14px' }}>
               <div style={{ display: 'flex', gap: '14px', alignItems: 'flex-start' }}>
-                <img
-                  src={selectedExerciseModal.gifUrl}
-                  alt={selectedExerciseModal.name}
-                  style={{ width: '140px', height: '140px', borderRadius: '12px', background: '#000', objectFit: 'cover' }}
-                />
+                {selectedExerciseModal.gifUrl ? (
+                  <img
+                    src={selectedExerciseModal.gifUrl}
+                    alt={selectedExerciseModal.name}
+                    style={{ width: '140px', height: '140px', borderRadius: '12px', background: '#000', objectFit: 'cover' }}
+                  />
+                ) : (
+                  <div
+                    style={{
+                      width: '140px',
+                      height: '140px',
+                      borderRadius: '12px',
+                      background: '#0d1117',
+                      border: '1px solid #283248',
+                      display: 'flex',
+                      flexDirection: 'column',
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                      gap: '8px',
+                      color: '#94a3b8',
+                      flexShrink: 0,
+                    }}
+                  >
+                    <Dumbbell className="w-10 h-10 text-rose-500/60" />
+                    <span style={{ fontSize: '11px', fontWeight: 600 }}>Custom Lift</span>
+                  </div>
+                )}
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
                   <div style={{ fontSize: '12px', color: '#94a3b8' }}>
                     <strong>Body Parts:</strong> {selectedExerciseModal.bodyParts?.join(', ') || 'N/A'}
@@ -916,8 +1095,21 @@ export const ExerciseKanbanView: React.FC<ExerciseKanbanViewProps> = ({
               )}
             </div>
 
-            <div className="modal-footer">
-              <button className="btn-ghost" onClick={() => setSelectedExerciseModal(null)}>Close</button>
+            <div className="modal-footer" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+                <button className="btn-ghost" onClick={() => setSelectedExerciseModal(null)}>Close</button>
+                {selectedExerciseModal.exerciseId.startsWith('custom-') && (
+                  <button
+                    type="button"
+                    className="btn-ghost"
+                    style={{ color: '#f43f5e', borderColor: 'rgba(244, 63, 94, 0.4)', display: 'inline-flex', alignItems: 'center', gap: '6px' }}
+                    onClick={() => handleDeleteCustomExercise(selectedExerciseModal.exerciseId)}
+                  >
+                    <Trash2 className="w-3.5 h-3.5" />
+                    Delete Exercise
+                  </button>
+                )}
+              </div>
               <button
                 className="btn-primary"
                 onClick={() => {
@@ -928,6 +1120,154 @@ export const ExerciseKanbanView: React.FC<ExerciseKanbanViewProps> = ({
                 Select Exercise for Workout
               </button>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* Create Custom Exercise Modal */}
+      {isAddModalOpen && (
+        <div className="modal-backdrop" onClick={() => setIsAddModalOpen(false)}>
+          <div
+            className="modal"
+            onClick={(e) => e.stopPropagation()}
+            style={{ maxWidth: '520px', background: '#121622', border: '1px solid #283248' }}
+          >
+            <div className="modal-header">
+              <div className="modal-date" style={{ color: '#ffffff', fontSize: '18px', display: 'flex', alignItems: 'center', gap: '8px' }}>
+                <Dumbbell className="w-5 h-5 text-rose-500" />
+                Add Custom Exercise
+              </div>
+              <button className="icon-btn" onClick={() => setIsAddModalOpen(false)}>✕</button>
+            </div>
+
+            <form onSubmit={handleSaveNewExercise}>
+              <div className="modal-body" style={{ gap: '14px' }}>
+                {/* Exercise Name */}
+                <div>
+                  <label style={{ fontSize: '11px', fontWeight: 700, color: '#94a3b8', textTransform: 'uppercase', letterSpacing: '0.5px' }}>
+                    Exercise Name *
+                  </label>
+                  <input
+                    type="text"
+                    required
+                    placeholder="e.g. Incline Smith Machine Press"
+                    value={newExerciseForm.name}
+                    onChange={(e) => setNewExerciseForm({ ...newExerciseForm, name: e.target.value })}
+                    className="n2-input-field"
+                    style={{ marginTop: '5px', paddingLeft: '12px' }}
+                  />
+                </div>
+
+                {/* Body Part & Equipment */}
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '10px' }}>
+                  <div>
+                    <label style={{ fontSize: '11px', fontWeight: 700, color: '#94a3b8', textTransform: 'uppercase', letterSpacing: '0.5px' }}>
+                      Body Part
+                    </label>
+                    <select
+                      value={newExerciseForm.bodyPart}
+                      onChange={(e) => setNewExerciseForm({ ...newExerciseForm, bodyPart: e.target.value })}
+                      className="n2-select-dropdown"
+                      style={{ marginTop: '5px' }}
+                    >
+                      {BODY_PART_OPTIONS.filter((o) => o.value !== 'all').map((opt) => (
+                        <option key={opt.value} value={opt.value}>
+                          {opt.label}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+
+                  <div>
+                    <label style={{ fontSize: '11px', fontWeight: 700, color: '#94a3b8', textTransform: 'uppercase', letterSpacing: '0.5px' }}>
+                      Equipment
+                    </label>
+                    <select
+                      value={newExerciseForm.equipment}
+                      onChange={(e) => setNewExerciseForm({ ...newExerciseForm, equipment: e.target.value })}
+                      className="n2-select-dropdown"
+                      style={{ marginTop: '5px' }}
+                    >
+                      {EQUIPMENT_OPTIONS.filter((o) => o.value !== 'all').map((opt) => (
+                        <option key={opt.value} value={opt.value}>
+                          {opt.label}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                </div>
+
+                {/* Target & Secondary Muscles */}
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '10px' }}>
+                  <div>
+                    <label style={{ fontSize: '11px', fontWeight: 700, color: '#94a3b8', textTransform: 'uppercase', letterSpacing: '0.5px' }}>
+                      Target Muscle
+                    </label>
+                    <input
+                      type="text"
+                      placeholder="e.g. Upper Pectorals"
+                      value={newExerciseForm.targetMuscle}
+                      onChange={(e) => setNewExerciseForm({ ...newExerciseForm, targetMuscle: e.target.value })}
+                      className="n2-input-field"
+                      style={{ marginTop: '5px', paddingLeft: '12px' }}
+                    />
+                  </div>
+
+                  <div>
+                    <label style={{ fontSize: '11px', fontWeight: 700, color: '#94a3b8', textTransform: 'uppercase', letterSpacing: '0.5px' }}>
+                      Secondary Muscles
+                    </label>
+                    <input
+                      type="text"
+                      placeholder="e.g. Front Delts, Triceps"
+                      value={newExerciseForm.secondaryMuscles}
+                      onChange={(e) => setNewExerciseForm({ ...newExerciseForm, secondaryMuscles: e.target.value })}
+                      className="n2-input-field"
+                      style={{ marginTop: '5px', paddingLeft: '12px' }}
+                    />
+                  </div>
+                </div>
+
+                {/* Image or GIF URL */}
+                <div>
+                  <label style={{ fontSize: '11px', fontWeight: 700, color: '#94a3b8', textTransform: 'uppercase', letterSpacing: '0.5px' }}>
+                    Image / Animated GIF URL (Optional)
+                  </label>
+                  <input
+                    type="url"
+                    placeholder="https://..."
+                    value={newExerciseForm.gifUrl}
+                    onChange={(e) => setNewExerciseForm({ ...newExerciseForm, gifUrl: e.target.value })}
+                    className="n2-input-field"
+                    style={{ marginTop: '5px', paddingLeft: '12px' }}
+                  />
+                </div>
+
+                {/* Form Steps & Instructions */}
+                <div>
+                  <label style={{ fontSize: '11px', fontWeight: 700, color: '#94a3b8', textTransform: 'uppercase', letterSpacing: '0.5px' }}>
+                    Form Steps & Technique Cues (Optional)
+                  </label>
+                  <textarea
+                    rows={3}
+                    placeholder="1. Set incline bench at 30 degrees.&#10;2. Lower bar slowly to upper chest.&#10;3. Drive up explosive."
+                    value={newExerciseForm.instructions}
+                    onChange={(e) => setNewExerciseForm({ ...newExerciseForm, instructions: e.target.value })}
+                    className="n2-input-field"
+                    style={{ marginTop: '5px', paddingLeft: '12px', resize: 'vertical' }}
+                  />
+                </div>
+              </div>
+
+              <div className="modal-footer" style={{ borderTop: '1px solid #283248', padding: '14px 16px' }}>
+                <button type="button" className="btn-ghost" onClick={() => setIsAddModalOpen(false)}>
+                  Cancel
+                </button>
+                <button type="submit" className="btn-primary">
+                  Save to Library
+                </button>
+              </div>
+            </form>
           </div>
         </div>
       )}

@@ -1,13 +1,14 @@
-import React, { useState, useRef } from 'react';
-import { Trophy, Dumbbell, Calendar, ChevronDown, ChevronRight, Clock } from 'lucide-react';
+import React, { useState, useRef, useEffect } from 'react';
+import { Trophy, Dumbbell, Calendar, ChevronDown, ChevronRight, Clock, MoreVertical, Pencil, RotateCcw, Share2, Star, Trash2 } from 'lucide-react';
 import { ExerciseIllustration } from './ExerciseIllustration';
 
 const PHASES: Record<string, { color: string; label: string }> = {
-  Hypertrophy: { color: "#B08D57", label: "Hypertrophy Phase" },
-  Strength: { color: "#5C7A8A", label: "Strength Phase" },
-  Peaking: { color: "#C1432E", label: "Peaking Phase" },
-  Accumulation: { color: "#7A8B6F", label: "Accumulation Phase" },
-  Base: { color: "#6B6F76", label: "Base Building" },
+  Hypertrophy: { color: "#f59e0b", label: "Hypertrophy Phase" },
+  Strength: { color: "#3b82f6", label: "Strength Phase" },
+  Peaking: { color: "#f43f5e", label: "Peaking Phase" },
+  Accumulation: { color: "#10b981", label: "Accumulation Phase" },
+  Base: { color: "#a855f7", label: "Base Building" },
+  Deload: { color: "#06b6d4", label: "Deload Phase" },
 };
 
 function formatDateCustom(dateStr: string) {
@@ -35,6 +36,7 @@ interface SetEntry {
   weight: string | number;
   reps: string | number;
   isPR: boolean;
+  equipment?: 'raw' | 'gear';
 }
 
 interface LiftEntry {
@@ -53,6 +55,7 @@ export interface DayEntry {
   bodyTags: string[];
   lifts: LiftEntry[];
   notes: string;
+  durationSeconds?: number;
 }
 
 export interface Microcycle {
@@ -79,7 +82,9 @@ interface TimelineFeedViewProps {
   mesocycles: Mesocycle[];
   selectedMesoId: string | null;
   onSelectMeso: (id: string) => void;
-  onDayClick: (mesoId: string, micId: string, day: DayEntry) => void;
+  onDayClick: (mesoId: string, micId: string, day: DayEntry, initialEditMode?: boolean) => void;
+  onDeleteDay?: (dayId: string) => void;
+  onPerformAgain?: (day: DayEntry) => void;
 }
 
 export const TimelineFeedView: React.FC<TimelineFeedViewProps> = ({
@@ -87,11 +92,66 @@ export const TimelineFeedView: React.FC<TimelineFeedViewProps> = ({
   selectedMesoId,
   onSelectMeso,
   onDayClick,
+  onDeleteDay,
+  onPerformAgain,
 }) => {
   const [selectedMesoDropdown, setSelectedMesoDropdown] = useState(false);
   const [expandedMcs, setExpandedMcs] = useState<Record<string, boolean>>({});
   const [expandedSessions, setExpandedSessions] = useState<Record<string, boolean>>({});
+  const [activeMenuSession, setActiveMenuSession] = useState<{ mesoId: string; mcId: string; day: DayEntry } | null>(null);
+  const [favorites, setFavorites] = useState<string[]>([]);
+  const [shareToast, setShareToast] = useState(false);
   const clickTimeoutRef = useRef<Record<string, any>>({});
+
+  useEffect(() => {
+    try {
+      const favs = JSON.parse(localStorage.getItem('iron_favorite_workouts') || '[]');
+      setFavorites(Array.isArray(favs) ? favs : []);
+    } catch {
+      setFavorites([]);
+    }
+  }, []);
+
+  const handleToggleFavorite = (dayId: string, e: React.MouseEvent) => {
+    e.stopPropagation();
+    try {
+      let updated: string[];
+      if (favorites.includes(dayId)) {
+        updated = favorites.filter((id) => id !== dayId);
+      } else {
+        updated = [...favorites, dayId];
+      }
+      setFavorites(updated);
+      localStorage.setItem('iron_favorite_workouts', JSON.stringify(updated));
+    } catch (err) {
+      console.error(err);
+    }
+  };
+
+  const handleShareSession = (day: DayEntry, e: React.MouseEvent) => {
+    e.stopPropagation();
+    const lines = [
+      `🏋️ ${day.title || 'Workout Session'}`,
+      `📅 ${formatDateCustom(day.date)}`,
+      day.bodyTags && day.bodyTags.length > 0 ? `🎯 Focus: ${day.bodyTags.join(', ')}` : '',
+      '',
+      ...(day.lifts || []).map((l) => {
+        const setsText = (l.sets || [])
+          .map((s) => `${s.weight || 0}${l.unit || 'kg'} × ${s.reps || 0}`)
+          .join(', ');
+        return `• ${l.name}: ${setsText}`;
+      }),
+      day.notes ? `\n📝 Notes: ${day.notes}` : '',
+    ].filter(Boolean);
+
+    const text = lines.join('\n');
+    if (navigator.clipboard) {
+      navigator.clipboard.writeText(text).then(() => {
+        setShareToast(true);
+        setTimeout(() => setShareToast(false), 2500);
+      });
+    }
+  };
 
   const toggleMcExpand = (mcId: string) => {
     setExpandedMcs((prev) => ({ ...prev, [mcId]: !prev[mcId] }));
@@ -104,7 +164,7 @@ export const TimelineFeedView: React.FC<TimelineFeedViewProps> = ({
     if (clickTimeoutRef.current[dayId]) {
       clearTimeout(clickTimeoutRef.current[dayId]);
       clickTimeoutRef.current[dayId] = null;
-      onDayClick(mesoId, mcId, day);
+      onDayClick(mesoId, mcId, day, false);
     } else {
       clickTimeoutRef.current[dayId] = setTimeout(() => {
         clickTimeoutRef.current[dayId] = null;
@@ -123,13 +183,25 @@ export const TimelineFeedView: React.FC<TimelineFeedViewProps> = ({
     return (
       <div className="feed-view-container">
         <div style={{ padding: '40px', textAlign: 'center', color: '#94a3b8' }}>
-          No mesocycles found. Create one in Library.
+          No mesocycles found. Create one in Periodisation Settings.
         </div>
       </div>
     );
   }
 
   const phaseInfo = PHASES[activeMeso.phaseKey] || { color: '#C1432E', label: activeMeso.phaseKey };
+
+  const isWorkoutSession = (day: DayEntry | null | undefined): boolean => {
+    if (!day) return false;
+    if (['recovery', 'event', 'illness', 'note', 'empty'].includes(day.type)) {
+      return false;
+    }
+    const title = (day.title || '').trim().toLowerCase();
+    if (title === 'recovery' || title === 'rest' || title.includes('rest day') || title === 'active recovery') {
+      return false;
+    }
+    return day.type === 'workout' || (Array.isArray(day.lifts) && day.lifts.length > 0);
+  };
 
   // Calculate live statistics for the current mesocycle
   let totalWorkoutsLogged = 0;
@@ -138,7 +210,7 @@ export const TimelineFeedView: React.FC<TimelineFeedViewProps> = ({
 
   activeMeso.microcycles.forEach((mc) => {
     mc.days.forEach((day) => {
-      if (day.type !== 'empty' && day.lifts && day.lifts.length > 0) {
+      if (isWorkoutSession(day) && day.lifts && day.lifts.length > 0) {
         totalWorkoutsLogged++;
         day.lifts.forEach((lift) => {
           (lift.sets || []).forEach((set) => {
@@ -159,20 +231,39 @@ export const TimelineFeedView: React.FC<TimelineFeedViewProps> = ({
   );
 
   if (!currentActiveMc) {
-    const withLogs = activeMeso.microcycles.filter((mc) => mc.days.some((d) => d.type !== 'empty'));
+    const withLogs = activeMeso.microcycles.filter((mc) => mc.days.some(isWorkoutSession));
     currentActiveMc = withLogs[withLogs.length - 1] || activeMeso.microcycles[0] || null;
   }
 
-  // Sort logged sessions inside the active microcycle REVERSE-CHRONOLOGICALLY (latest sessions on top!)
+  // Sort logged workout sessions inside the active microcycle REVERSE-CHRONOLOGICALLY (latest sessions on top!)
   const loggedDays = (currentActiveMc?.days || [])
-    .filter((d) => d.type !== 'empty')
+    .filter(isWorkoutSession)
     .slice()
     .sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : 0));
 
-  // Identify previous microcycles in the current mesocycle
+  // Identify previous microcycles in the current mesocycle that have workout sessions
   const previousMicrocycles = currentActiveMc
-    ? activeMeso.microcycles.filter((mc) => mc.index < currentActiveMc.index).sort((a, b) => b.index - a.index)
+    ? activeMeso.microcycles
+        .filter((mc) => mc.index < currentActiveMc.index && mc.days.some(isWorkoutSession))
+        .sort((a, b) => b.index - a.index)
     : [];
+
+  const renderSessionMenuBtn = (mesoId: string, mcId: string, day: DayEntry) => {
+    return (
+      <button
+        type="button"
+        className="feed-session-menu-btn"
+        onClick={(e) => {
+          e.stopPropagation();
+          setActiveMenuSession({ mesoId, mcId, day });
+        }}
+        title="Workout Session Options"
+        aria-label="Workout Session Options"
+      >
+        <MoreVertical className="w-4 h-4 text-slate-300" />
+      </button>
+    );
+  };
 
   return (
     <div className="feed-view-container">
@@ -563,6 +654,163 @@ export const TimelineFeedView: React.FC<TimelineFeedViewProps> = ({
             min-width: 100%;
           }
         }
+
+        .feed-session-menu-btn {
+          background: rgba(255, 255, 255, 0.06);
+          border: 1px solid #283347;
+          color: #94a3b8;
+          width: 26px;
+          height: 26px;
+          border-radius: 7px;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          cursor: pointer;
+          transition: all 0.15s ease;
+        }
+        .feed-session-menu-btn:hover {
+          background: rgba(255, 255, 255, 0.14);
+          color: #ffffff;
+          border-color: #3b82f6;
+        }
+        .workout-sheet-backdrop {
+          position: fixed;
+          inset: 0;
+          background: rgba(0, 0, 0, 0.78);
+          backdrop-filter: blur(6px);
+          z-index: 12000;
+          display: flex;
+          align-items: flex-end;
+          justify-content: center;
+          padding: 0;
+          animation: fadeInSheet 0.18s ease;
+        }
+        @keyframes fadeInSheet {
+          from { opacity: 0; }
+          to { opacity: 1; }
+        }
+
+        .workout-sheet-container {
+          background: #141824;
+          border: 1px solid #283248;
+          border-bottom: none;
+          border-radius: 24px 24px 0 0;
+          width: 100%;
+          max-width: 480px;
+          padding: 16px 18px 26px;
+          box-shadow: 0 -12px 40px rgba(0, 0, 0, 0.85);
+          animation: slideUpSheet 0.22s cubic-bezier(0.16, 1, 0.3, 1);
+          max-height: 90vh;
+          overflow-y: auto;
+        }
+
+        .workout-sheet-drag-handle {
+          width: 40px;
+          height: 4px;
+          background: #374151;
+          border-radius: 2px;
+          margin: 0 auto 14px;
+        }
+
+        .workout-sheet-header {
+          text-align: center;
+          margin-bottom: 16px;
+          padding-bottom: 12px;
+          border-bottom: 1px solid #232c3d;
+        }
+
+        .workout-sheet-title {
+          font-family: 'Oswald', sans-serif;
+          font-size: 18px;
+          font-weight: 700;
+          color: #ffffff;
+          letter-spacing: 0.5px;
+          text-transform: uppercase;
+        }
+
+        .workout-sheet-date {
+          font-size: 12px;
+          color: #94a3b8;
+          margin-top: 3px;
+        }
+
+        .workout-sheet-options {
+          display: flex;
+          flex-direction: column;
+          gap: 7px;
+        }
+
+        .workout-sheet-btn {
+          width: 100%;
+          background: #1a2030;
+          border: 1px solid #263044;
+          border-radius: 12px;
+          padding: 10px 14px;
+          display: flex;
+          align-items: center;
+          gap: 14px;
+          cursor: pointer;
+          transition: all 0.15s ease;
+          text-align: left;
+        }
+
+        .workout-sheet-btn:hover {
+          background: #222a3e;
+          border-color: #3b82f6;
+          transform: translateY(-1px);
+        }
+
+        .workout-sheet-btn-icon {
+          width: 36px;
+          height: 36px;
+          border-radius: 10px;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          flex-shrink: 0;
+        }
+
+        .workout-sheet-btn-text {
+          display: flex;
+          flex-direction: column;
+          gap: 2px;
+          flex: 1;
+        }
+
+        .workout-sheet-btn-title {
+          font-size: 14px;
+          font-weight: 600;
+          color: #ffffff;
+        }
+
+        .workout-sheet-btn-sub {
+          font-size: 11px;
+          color: #94a3b8;
+        }
+
+        .workout-sheet-btn-danger:hover {
+          border-color: #ef4444;
+          background: rgba(239, 68, 68, 0.12);
+        }
+
+        .workout-sheet-cancel-btn {
+          width: 100%;
+          margin-top: 12px;
+          padding: 12px;
+          background: rgba(255, 255, 255, 0.05);
+          border: 1px solid #283248;
+          border-radius: 12px;
+          color: #94a3b8;
+          font-size: 13.5px;
+          font-weight: 700;
+          cursor: pointer;
+          transition: all 0.15s ease;
+        }
+
+        .workout-sheet-cancel-btn:hover {
+          background: rgba(255, 255, 255, 0.1);
+          color: #ffffff;
+        }
       `}</style>
 
       {/* Top Banner: Current Mesocycle & Phase Information */}
@@ -694,6 +942,11 @@ export const TimelineFeedView: React.FC<TimelineFeedViewProps> = ({
                       </div>
 
                       <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                        {favorites.includes(day.id) && (
+                          <span title="Favorite Workout" style={{ color: "#fbbf24", display: "inline-flex" }}>
+                            <Star className="w-3.5 h-3.5 fill-amber-400 text-amber-400" />
+                          </span>
+                        )}
                         {hasPR && (
                           <span className="pr-trophy-badge">
                             <Trophy className="w-3 h-3 text-amber-400" />
@@ -703,6 +956,7 @@ export const TimelineFeedView: React.FC<TimelineFeedViewProps> = ({
                         <span className="mc-session-count-badge" style={{ fontSize: '10px' }}>
                           {day.lifts?.length || 0} {day.lifts?.length === 1 ? 'exercise' : 'exercises'}
                         </span>
+                        {renderSessionMenuBtn(activeMeso.id, currentActiveMc!.id, day)}
                       </div>
                     </div>
 
@@ -721,7 +975,7 @@ export const TimelineFeedView: React.FC<TimelineFeedViewProps> = ({
                               className="lift-mini-chip"
                               onClick={(e) => {
                                 e.stopPropagation();
-                                onDayClick(activeMeso.id, currentActiveMc!.id, day);
+                                onDayClick(activeMeso.id, currentActiveMc!.id, day, false);
                               }}
                             >
                               <div className="lift-icon-box">
@@ -763,7 +1017,7 @@ export const TimelineFeedView: React.FC<TimelineFeedViewProps> = ({
             {previousMicrocycles.map((mc) => {
               const isExpanded = !!expandedMcs[mc.id];
               const mcLoggedDays = (mc.days || [])
-                .filter((d) => d.type !== 'empty' || (d.lifts && d.lifts.length > 0))
+                .filter(isWorkoutSession)
                 .slice()
                 .sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : 0));
 
@@ -835,6 +1089,11 @@ export const TimelineFeedView: React.FC<TimelineFeedViewProps> = ({
                                   </div>
 
                                   <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                                    {favorites.includes(day.id) && (
+                                      <span title="Favorite Workout" style={{ color: "#fbbf24", display: "inline-flex" }}>
+                                        <Star className="w-3.5 h-3.5 fill-amber-400 text-amber-400" />
+                                      </span>
+                                    )}
                                     {hasPR && (
                                       <span className="pr-trophy-badge">
                                         <Trophy className="w-3 h-3 text-amber-400" />
@@ -844,6 +1103,7 @@ export const TimelineFeedView: React.FC<TimelineFeedViewProps> = ({
                                     <span className="mc-session-count-badge" style={{ fontSize: '10px' }}>
                                       {day.lifts?.length || 0} {day.lifts?.length === 1 ? 'exercise' : 'exercises'}
                                     </span>
+                                    {renderSessionMenuBtn(activeMeso.id, mc.id, day)}
                                   </div>
                                 </div>
 
@@ -862,7 +1122,7 @@ export const TimelineFeedView: React.FC<TimelineFeedViewProps> = ({
                                           className="lift-mini-chip"
                                           onClick={(e) => {
                                             e.stopPropagation();
-                                            onDayClick(activeMeso.id, mc.id, day);
+                                            onDayClick(activeMeso.id, mc.id, day, false);
                                           }}
                                         >
                                           <div className="lift-icon-box">
@@ -892,6 +1152,172 @@ export const TimelineFeedView: React.FC<TimelineFeedViewProps> = ({
               );
             })}
           </div>
+        </div>
+      )}
+
+      {/* Workout Options Bottom Action Sheet (True fixed overlay - never overlaps with cards) */}
+      {activeMenuSession && (
+        <div
+          className="workout-sheet-backdrop"
+          onClick={() => setActiveMenuSession(null)}
+        >
+          <div
+            className="workout-sheet-container"
+            onClick={(e) => e.stopPropagation()}
+          >
+            {/* Drag handle */}
+            <div className="workout-sheet-drag-handle" />
+
+            {/* Header info */}
+            <div className="workout-sheet-header">
+              <div className="workout-sheet-title">
+                {activeMenuSession.day.title || "Workout Session"}
+              </div>
+              <div className="workout-sheet-date">
+                {formatDateCustom(activeMenuSession.day.date)} • {activeMenuSession.day.lifts?.length || 0} exercises
+              </div>
+            </div>
+
+            {/* Menu options list */}
+            <div className="workout-sheet-options">
+              {/* 1. Edit */}
+              <button
+                type="button"
+                className="workout-sheet-btn"
+                onClick={() => {
+                  const s = activeMenuSession;
+                  setActiveMenuSession(null);
+                  onDayClick(s.mesoId, s.mcId, s.day, true);
+                }}
+              >
+                <div className="workout-sheet-btn-icon" style={{ background: "rgba(56, 189, 248, 0.15)", color: "#38bdf8" }}>
+                  <Pencil size={18} />
+                </div>
+                <div className="workout-sheet-btn-text">
+                  <div className="workout-sheet-btn-title">Edit Workout</div>
+                  <div className="workout-sheet-btn-sub">Modify exercises, sets, weights, and reps</div>
+                </div>
+              </button>
+
+              {/* 2. Perform Again */}
+              <button
+                type="button"
+                className="workout-sheet-btn"
+                onClick={() => {
+                  const s = activeMenuSession;
+                  setActiveMenuSession(null);
+                  if (onPerformAgain) onPerformAgain(s.day);
+                }}
+              >
+                <div className="workout-sheet-btn-icon" style={{ background: "rgba(16, 185, 129, 0.15)", color: "#34d399" }}>
+                  <RotateCcw size={18} />
+                </div>
+                <div className="workout-sheet-btn-text">
+                  <div className="workout-sheet-btn-title">Perform Again</div>
+                  <div className="workout-sheet-btn-sub">Start a live workout with these exercises</div>
+                </div>
+              </button>
+
+              {/* 3. Share */}
+              <button
+                type="button"
+                className="workout-sheet-btn"
+                onClick={(e) => {
+                  const s = activeMenuSession;
+                  setActiveMenuSession(null);
+                  handleShareSession(s.day, e);
+                }}
+              >
+                <div className="workout-sheet-btn-icon" style={{ background: "rgba(99, 102, 241, 0.15)", color: "#818cf8" }}>
+                  <Share2 size={18} />
+                </div>
+                <div className="workout-sheet-btn-text">
+                  <div className="workout-sheet-btn-title">Share Workout</div>
+                  <div className="workout-sheet-btn-sub">Copy formatted summary to clipboard</div>
+                </div>
+              </button>
+
+              {/* 4. Favorites */}
+              <button
+                type="button"
+                className="workout-sheet-btn"
+                onClick={(e) => {
+                  const s = activeMenuSession;
+                  handleToggleFavorite(s.day.id, e);
+                  setActiveMenuSession(null);
+                }}
+              >
+                <div className="workout-sheet-btn-icon" style={{ background: "rgba(245, 158, 11, 0.15)", color: "#fbbf24" }}>
+                  <Star
+                    size={18}
+                    className={favorites.includes(activeMenuSession.day.id) ? "fill-amber-400" : ""}
+                  />
+                </div>
+                <div className="workout-sheet-btn-text">
+                  <div className="workout-sheet-btn-title">
+                    {favorites.includes(activeMenuSession.day.id) ? "Remove from Favorites" : "Add to Favorites"}
+                  </div>
+                  <div className="workout-sheet-btn-sub">Bookmark this routine for quick access</div>
+                </div>
+              </button>
+
+              {/* Divider */}
+              <div style={{ height: "1px", background: "#252d3d", margin: "6px 0" }} />
+
+              {/* 5. Delete */}
+              <button
+                type="button"
+                className="workout-sheet-btn workout-sheet-btn-danger"
+                onClick={() => {
+                  const s = activeMenuSession;
+                  setActiveMenuSession(null);
+                  if (window.confirm("Are you sure you want to delete this workout session?")) {
+                    if (onDeleteDay) onDeleteDay(s.day.id);
+                  }
+                }}
+              >
+                <div className="workout-sheet-btn-icon" style={{ background: "rgba(239, 68, 68, 0.15)", color: "#f87171" }}>
+                  <Trash2 size={18} />
+                </div>
+                <div className="workout-sheet-btn-text">
+                  <div className="workout-sheet-btn-title" style={{ color: "#f87171" }}>Delete Workout</div>
+                  <div className="workout-sheet-btn-sub">Permanently remove this session log</div>
+                </div>
+              </button>
+            </div>
+
+            {/* Cancel Button */}
+            <button
+              type="button"
+              className="workout-sheet-cancel-btn"
+              onClick={() => setActiveMenuSession(null)}
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Share toast notification */}
+      {shareToast && (
+        <div
+          style={{
+            position: 'fixed',
+            bottom: '30px',
+            left: '50%',
+            transform: 'translateX(-50%)',
+            background: '#059669',
+            color: '#ffffff',
+            fontSize: '12.5px',
+            fontWeight: 700,
+            padding: '8px 20px',
+            borderRadius: '20px',
+            boxShadow: '0 6px 20px rgba(0,0,0,0.5)',
+            zIndex: 10000,
+            pointerEvents: 'none',
+          }}
+        >
+          ✓ Workout summary copied to clipboard!
         </div>
       )}
 

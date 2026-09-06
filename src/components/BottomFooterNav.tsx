@@ -1,7 +1,6 @@
 import React from 'react';
-import { Home, Search, PlusCircle, Library, User, Play } from 'lucide-react';
-
-export type TabType = 'library' | 'home' | 'explore' | 'you';
+import { Home, Search, PlusCircle, CalendarRange, User, Play } from 'lucide-react';
+import type { TabType } from './SidebarNav';
 
 interface BottomFooterNavProps {
   activeTab: TabType;
@@ -181,13 +180,13 @@ export const BottomFooterNav: React.FC<BottomFooterNavProps> = ({
             <span>Workout</span>
           </button>
 
-          {/* 4. Library Tab */}
+          {/* 4. Periodisation Tab */}
           <button
-            onClick={() => onSelectTab('library')}
-            className={`footer-tab-btn ${activeTab === 'library' ? 'footer-tab-btn-active' : ''}`}
+            onClick={() => onSelectTab('periodisation')}
+            className={`footer-tab-btn ${activeTab === 'periodisation' ? 'footer-tab-btn-active' : ''}`}
           >
-            <Library className="w-5 h-5 stroke-[1.8px]" />
-            <span>Library</span>
+            <CalendarRange className="w-5 h-5 stroke-[1.8px]" />
+            <span>Periodisation</span>
           </button>
 
           {/* 5. You Tab -> Opens Profile Page & PR Shelf */}

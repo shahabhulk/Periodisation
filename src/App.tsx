@@ -1,12 +1,14 @@
 import React, { useState, useEffect, useRef, useMemo } from "react";
-import { Pencil, Trash2 } from "lucide-react";
+import { Pencil, Trash2, MoreVertical, RotateCcw, Share2, Star, BatteryCharging, AlertCircle, Timer, Dumbbell, Layers } from "lucide-react";
 import { SidebarNav, NavHeaderButton, type TabType } from "./components/SidebarNav";
 import { ExerciseKanbanView } from "./components/ExerciseKanbanView";
 import { ProfileView } from "./components/ProfileView";
 import { TimelineFeedView } from "./components/TimelineFeedView";
+import { PeriodisationSettingsView } from "./components/PeriodisationSettingsView";
 import { Analytics } from "./components/Analytics";
 import { INITIAL_WORKOUT_DATA } from "./data/initialWorkoutData";
 import type { WorkoutEntry } from "./types/workout";
+import { fetchLyftaExercises } from "./services/lyftaApi";
 
 /* ============================================================
    IRON LEDGER — powerlifting periodisation tracker
@@ -15,11 +17,12 @@ import type { WorkoutEntry } from "./types/workout";
    ============================================================ */
 
 const PHASES: Record<string, { color: string; label: string }> = {
-  Hypertrophy: { color: "#B08D57", label: "Hypertrophy" },
-  Strength: { color: "#5C7A8A", label: "Strength" },
-  Peaking: { color: "#C1432E", label: "Peaking" },
-  Accumulation: { color: "#7A8B6F", label: "Accumulation" },
-  Base: { color: "#6B6F76", label: "Base Building" },
+  Hypertrophy: { color: "#f59e0b", label: "Hypertrophy" },
+  Strength: { color: "#3b82f6", label: "Strength" },
+  Peaking: { color: "#f43f5e", label: "Peaking" },
+  Accumulation: { color: "#10b981", label: "Accumulation" },
+  Base: { color: "#a855f7", label: "Base Building" },
+  Deload: { color: "#06b6d4", label: "Deload" },
 };
 
 function phaseKeyFromName(name: string) {
@@ -28,15 +31,16 @@ function phaseKeyFromName(name: string) {
   if (n.includes("accumul")) return "Accumulation";
   if (n.includes("strength")) return "Strength";
   if (n.includes("hypertrophy")) return "Hypertrophy";
+  if (n.includes("deload") || n.includes("recovery")) return "Deload";
   return "Base";
 }
 
-const DAY_TYPES: Record<string, { label: string; color: string }> = {
-  workout: { label: "Workout", color: "var(--phase)" },
-  recovery: { label: "Recovery", color: "#3A3F45" },
-  event: { label: "Event", color: "#8A7A5C" },
-  illness: { label: "Illness", color: "#7A4A42" },
-  note: { label: "Note", color: "#4A4E55" },
+const DAY_TYPES: Record<string, { label: string; color: string; iconType?: 'workout' | 'recovery' | 'alert' }> = {
+  workout: { label: "Workout", color: "#10b981", iconType: 'workout' },
+  recovery: { label: "Recovery", color: "#38bdf8", iconType: 'recovery' },
+  event: { label: "Event", color: "#ef4444", iconType: 'alert' },
+  illness: { label: "Illness", color: "#ef4444", iconType: 'alert' },
+  note: { label: "Note", color: "#ef4444", iconType: 'alert' },
   empty: { label: "—", color: "transparent" },
 };
 
@@ -49,10 +53,6 @@ function addDays(dateStr: string, n: number) {
   const d = new Date(dateStr + "T00:00:00Z");
   d.setUTCDate(d.getUTCDate() + n);
   return d.toISOString().slice(0, 10);
-}
-function fmtDate(dateStr: string) {
-  const d = new Date(dateStr + "T00:00:00Z");
-  return d.toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric", timeZone: "UTC" });
 }
 function fmtDateFull(dateStr: string) {
   const d = new Date(dateStr + "T00:00:00Z");
@@ -77,6 +77,7 @@ interface SetEntry {
   weight: string | number;
   reps: string | number;
   isPR: boolean;
+  equipment?: 'raw' | 'gear';
 }
 
 interface LiftEntry {
@@ -95,6 +96,7 @@ interface DayEntry {
   bodyTags: string[];
   lifts: LiftEntry[];
   notes: string;
+  durationSeconds?: number;
 }
 
 interface Microcycle {
@@ -147,16 +149,27 @@ function healMesocycleDates(meso: Mesocycle): Mesocycle {
 
   const totalDays = meso.microcycles.reduce((acc, mc) => acc + mc.days.length, 0);
   const healedEnd = totalDays > 0 ? addDays(meso.start, totalDays - 1) : meso.end;
+  const today = todayStr();
+  const status = today < meso.start ? "upcoming" : today > healedEnd ? "completed" : "active";
 
   return {
     ...meso,
     end: healedEnd,
+    status,
     microcycles: healedMicrocycles,
   };
 }
 
 function healAllMesocycles(mesos: Mesocycle[], macros: Macrocycle[]): Mesocycle[] {
-  const macroList = macros && macros.length > 0 ? macros : seedMacrocycles();
+  const macroList = [...(macros && macros.length > 0 ? macros : seedMacrocycles())];
+  macroList.sort((a, b) => {
+    const dateA = a.start || "";
+    const dateB = b.start || "";
+    if (dateA && dateB && dateA !== dateB) {
+      return dateA.localeCompare(dateB);
+    }
+    return (a.index || 0) - (b.index || 0);
+  });
   const macroIdSet = new Set(macroList.map((m) => m.id));
   const defaultMacroId = macroList[0]?.id || "macro-1";
 
@@ -172,6 +185,16 @@ function healAllMesocycles(mesos: Mesocycle[], macros: Macrocycle[]): Mesocycle[
   const result: Mesocycle[] = [];
   macroList.forEach((macro) => {
     const list = byMacro[macro.id] || [];
+    // Sort mesocycles chronologically by start date so earlier phases appear first
+    list.sort((a, b) => {
+      const dateA = a.start || "";
+      const dateB = b.start || "";
+      if (dateA !== dateB) {
+        return dateA.localeCompare(dateB);
+      }
+      return (a.index || 0) - (b.index || 0);
+    });
+
     let macroMicCursor = 0;
 
     list.forEach((m, idx) => {
@@ -354,78 +377,234 @@ function PlateIcon({ size = 22, color = "#EDEAE2" }: { size?: number; color?: st
   );
 }
 
-function Sparkline({ points, color }: { points: { weight: number }[]; color: string }) {
-  if (!points || points.length < 2) return null;
-  const w = 120, h = 34, pad = 4;
-  const xs = points.map((_, i) => pad + (i * (w - pad * 2)) / (points.length - 1));
-  const min = Math.min(...points.map((p) => p.weight));
-  const max = Math.max(...points.map((p) => p.weight));
-  const range = max - min || 1;
-  const ys = points.map((p) => h - pad - ((p.weight - min) / range) * (h - pad * 2));
-  const d = xs.map((x, i) => `${i === 0 ? "M" : "L"}${x},${ys[i]}`).join(" ");
-  return (
-    <svg width={w} height={h} viewBox={`0 0 ${w} ${h}`}>
-      <path d={d} fill="none" stroke={color} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
-      {xs.map((x, i) => (
-        <circle key={i} cx={x} cy={ys[i]} r={i === xs.length - 1 ? 3 : 1.8} fill={color} />
-      ))}
-    </svg>
-  );
+/* ---------------- Day modal ---------------- */
+
+const SET_TYPE_ITEMS = [
+  // Left Column
+  { code: "W", label: "Warm-up", color: "#f59e0b", desc: "Low intensity set to prepare muscles and joints for working weight." },
+  { code: "F", label: "Failure", color: "#ef4444", desc: "Set performed to complete muscular failure (0 RIR)." },
+  { code: "L", label: "Left", color: "#10b981", desc: "Unilateral set performed for the left side only." },
+  { code: "R", label: "Right", color: "#a855f7", desc: "Unilateral set performed for the right side only." },
+  { code: "D", label: "Drop Set", color: "#3b82f6", desc: "Immediately drop weight and perform additional reps without rest." },
+  { code: "N", label: "Negative", color: "#f97316", desc: "Focus on the eccentric/lowering phase under heavy load." },
+  { code: "P", label: "Partial Reps", color: "#84cc16", desc: "Performing partial range-of-motion reps past technical failure." },
+  { code: "M", label: "Myo Reps", color: "#f43f5e", desc: "Rest-pause activation set followed by short mini-sets." },
+  { code: "FD", label: "Feeder Set", color: "#eab308", desc: "Low-fatigue set to acclimatize to heavier weight before working sets." },
+  { code: "T", label: "Top Set", color: "#6366f1", desc: "The primary and heaviest working set of the exercise." },
+  { code: "B", label: "Back-off Set", color: "#06b6d4", desc: "Lighter set performed after the top set for accumulated volume." },
+];
+
+function getSetTypeColor(type: string) {
+  const match = SET_TYPE_ITEMS.find((item) => item.code === type);
+  return match ? match.color : "#edeae2";
 }
 
-/* ---------------- PR shelf ---------------- */
+interface SwipeableSetRowProps {
+  s: SetEntry;
+  unit: string;
+  listSetsLength: number;
+  onOpenTypeModal: (id: string) => void;
+  updateSet: (id: string, patch: Partial<SetEntry>) => void;
+  removeSet: (id: string) => void;
+}
 
-function PRShelf({ prLog }: { prLog: PREntry[] }) {
-  const lifts = ["Squat", "Bench Press", "Deadlift", "Dumbbell Bench Press"];
+function SwipeableSetRow({
+  s,
+  unit,
+  listSetsLength,
+  onOpenTypeModal,
+  updateSet,
+  removeSet,
+}: SwipeableSetRowProps) {
+  const [offsetX, setOffsetX] = useState(0);
+  const [isSwiping, setIsSwiping] = useState(false);
+  const [isDeleting, setIsDeleting] = useState(false);
+  const touchStartXRef = useRef<number | null>(null);
+  const touchStartYRef = useRef<number | null>(null);
+  const isHorizontalRef = useRef<boolean | null>(null);
+
+  const handleTouchStart = (e: React.TouchEvent) => {
+    const target = e.target as HTMLElement;
+    if (target.closest("input, button, select, label")) {
+      touchStartXRef.current = null;
+      return;
+    }
+    touchStartXRef.current = e.touches[0].clientX;
+    touchStartYRef.current = e.touches[0].clientY;
+    isHorizontalRef.current = null;
+    setIsSwiping(true);
+  };
+
+  const handleTouchMove = (e: React.TouchEvent) => {
+    if (touchStartXRef.current === null) return;
+    const diffX = e.touches[0].clientX - touchStartXRef.current;
+    const diffY = e.touches[0].clientY - (touchStartYRef.current || 0);
+
+    if (isHorizontalRef.current === null) {
+      if (Math.abs(diffX) > 6 || Math.abs(diffY) > 6) {
+        isHorizontalRef.current = Math.abs(diffX) > Math.abs(diffY);
+      }
+    }
+
+    if (!isHorizontalRef.current) return;
+    if (diffX < 0) {
+      setOffsetX(diffX);
+    } else {
+      setOffsetX(0);
+    }
+  };
+
+  const handleTouchEnd = () => {
+    if (touchStartXRef.current === null) return;
+    touchStartXRef.current = null;
+    setIsSwiping(false);
+
+    if (offsetX < -70 && listSetsLength > 1) {
+      setIsDeleting(true);
+      setOffsetX(-400);
+      setTimeout(() => removeSet(s.id), 200);
+    } else {
+      setOffsetX(0);
+    }
+  };
+
+  const triggerDeleteSet = () => {
+    if (listSetsLength <= 1) return;
+    setIsDeleting(true);
+    setOffsetX(-400);
+    setTimeout(() => removeSet(s.id), 200);
+  };
+
   return (
-    <div className="pr-shelf">
-      {lifts.map((lift) => {
-        const entries = prLog
-          .filter((p) => p.lift === lift)
-          .sort((a, b) => (a.date > b.date ? 1 : -1));
-        const best = entries.reduce<PREntry | null>(
-          (acc, e) => (!acc || e.weight >= acc.weight ? e : acc),
-          null
-        );
-        return (
-          <div className="pr-card" key={lift}>
-            <div className="pr-card-top">
-              <PlateIcon size={16} color="var(--iron-red)" />
-              <span className="pr-lift-name">{lift}</span>
-            </div>
-            {best ? (
-              <>
-                <div className="pr-weight">
-                  {best.weight}
-                  <span className="pr-unit">{best.unit}</span>
-                  <span className="pr-reps">×{best.reps}</span>
-                </div>
-                <div className="pr-date">{fmtDateShort(best.date)}{best.note ? ` · ${best.note}` : ""}</div>
-                {entries.length > 1 && <Sparkline points={entries} color="var(--iron-red)" />}
-              </>
-            ) : (
-              <div className="pr-empty">No PR logged yet</div>
-            )}
-          </div>
-        );
-      })}
+    <div
+      className="swipe-set-outer"
+      style={{
+        position: "relative",
+        borderRadius: "8px",
+        overflow: "hidden",
+        maxHeight: isDeleting ? "0px" : "48px",
+        opacity: isDeleting ? 0 : 1,
+        transition: isDeleting ? "all 0.2s ease" : "none",
+      }}
+    >
+      {/* Red Background Behind Set */}
+      {listSetsLength > 1 && (
+        <div
+          onClick={triggerDeleteSet}
+          style={{
+            position: "absolute",
+            inset: 0,
+            background: "#dc2626",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "flex-end",
+            paddingRight: "14px",
+            borderRadius: "8px",
+            color: "#ffffff",
+            cursor: "pointer",
+          }}
+        >
+          <Trash2 size={16} />
+        </div>
+      )}
+
+      {/* Set Row Content */}
+      <div
+        className="set-row"
+        onTouchStart={handleTouchStart}
+        onTouchMove={handleTouchMove}
+        onTouchEnd={handleTouchEnd}
+        style={{
+          position: "relative",
+          zIndex: 2,
+          display: "flex",
+          alignItems: "center",
+          gap: "8px",
+          background: "var(--bg-elevated, #1a1e26)",
+          transform: `translateX(${offsetX}px)`,
+          transition: isSwiping ? "none" : "transform 0.2s cubic-bezier(0.16, 1, 0.3, 1)",
+          padding: "2px 0",
+        }}
+      >
+        {/* Set Type badge button */}
+        <button
+          type="button"
+          className="set-type-badge-btn"
+          onClick={() => onOpenTypeModal(s.id)}
+          title="Tap to change set type"
+          style={{ color: getSetTypeColor(s.type) }}
+        >
+          {s.type}
+        </button>
+
+        {/* Weight Input */}
+        <input
+          className="text-input set-num"
+          type="number"
+          placeholder="Wt"
+          value={s.weight}
+          onChange={(e) => updateSet(s.id, { weight: e.target.value })}
+          style={{ width: "58px", padding: "4px 6px", fontSize: "12px", background: "var(--bg-card)", border: "1px solid var(--border)", borderRadius: "6px" }}
+        />
+        <span style={{ fontSize: "11px", color: "var(--chalk-dim)" }}>{unit || "kg"}</span>
+
+        <span style={{ color: "var(--chalk-dim)", fontSize: "12px" }}>×</span>
+
+        {/* Reps Input */}
+        <input
+          className="text-input set-num"
+          type="number"
+          placeholder="Reps"
+          value={s.reps}
+          onChange={(e) => updateSet(s.id, { reps: e.target.value })}
+          style={{ width: "48px", padding: "4px 6px", fontSize: "12px", background: "var(--bg-card)", border: "1px solid var(--border)", borderRadius: "6px" }}
+        />
+        <span style={{ fontSize: "11px", color: "var(--chalk-dim)" }}>Reps</span>
+
+        {/* Raw vs Gear Segmented Switch */}
+        <div className="set-equip-toggle">
+          <button
+            type="button"
+            className={`set-equip-btn ${s.equipment !== 'gear' ? 'is-raw' : ''}`}
+            onClick={() => updateSet(s.id, { equipment: 'raw' })}
+            title="Raw set"
+          >
+            Raw
+          </button>
+          <button
+            type="button"
+            className={`set-equip-btn ${s.equipment === 'gear' ? 'is-gear' : ''}`}
+            onClick={() => updateSet(s.id, { equipment: 'gear' })}
+            title="Gear / Equipped set"
+          >
+            Gear
+          </button>
+        </div>
+      </div>
     </div>
   );
 }
-
-/* ---------------- Day modal ---------------- */
 
 interface LiftRowItemProps {
   l: LiftEntry;
   updateLift: (id: string, patch: Partial<LiftEntry>) => void;
   removeLift: (id: string) => void;
+  onOpenSetTypeModal: (liftId: string, setId: string) => void;
 }
 
-function LiftRowItem({ l, updateLift, removeLift }: LiftRowItemProps) {
+function LiftRowItem({ l, updateLift, removeLift, onOpenSetTypeModal }: LiftRowItemProps) {
   const [query, setQuery] = useState(String(l.name));
   const [suggestions, setSuggestions] = useState<{ exerciseId: string; name: string; gifUrl: string }[]>([]);
   const [showDropdown, setShowDropdown] = useState(false);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Swipe lift to remove state
+  const [offsetX, setOffsetX] = useState(0);
+  const [isSwiping, setIsSwiping] = useState(false);
+  const [isDeleting, setIsDeleting] = useState(false);
+  const touchStartXRef = useRef<number | null>(null);
+  const touchStartYRef = useRef<number | null>(null);
+  const isHorizontalRef = useRef<boolean | null>(null);
 
   // Sync query when l.name changes from outside
   useEffect(() => {
@@ -462,13 +641,19 @@ function LiftRowItem({ l, updateLift, removeLift }: LiftRowItemProps) {
     if (val.trim().length >= 2) {
       debounceRef.current = setTimeout(async () => {
         try {
-          const res = await fetch(`https://oss.exercisedb.dev/api/v1/exercises?name=${encodeURIComponent(val)}&limit=25`);
-          if (res.ok) {
-            const json = await res.json();
-            if (json.success && Array.isArray(json.data)) {
-              setSuggestions(json.data.slice(0, 20));
-              setShowDropdown(true);
-            }
+          const result = await fetchLyftaExercises({ search: val.trim(), limit: 20 });
+          if (result.exercises && result.exercises.length > 0) {
+            setSuggestions(
+              result.exercises.map((ex) => ({
+                exerciseId: ex.exerciseId,
+                name: ex.name,
+                gifUrl: ex.gifUrl,
+              }))
+            );
+            setShowDropdown(true);
+          } else {
+            setSuggestions([]);
+            setShowDropdown(false);
           }
         } catch (e) {
           console.error("Fuzzy search fetch failed:", e);
@@ -488,8 +673,10 @@ function LiftRowItem({ l, updateLift, removeLift }: LiftRowItemProps) {
   };
 
   const addSet = () => {
-    const nextNum = listSets.filter(s => s.type !== "W").length + 1;
-    const newSets = [...listSets, { id: uid(), type: String(nextNum), weight: "", reps: "", isPR: false }];
+    const nextNum = listSets.filter((s) => !isNaN(Number(s.type))).length + 1;
+    const lastSet = listSets[listSets.length - 1];
+    const prevEquipment = lastSet?.equipment || 'raw';
+    const newSets = [...listSets, { id: uid(), type: String(nextNum), weight: "", reps: "", isPR: false, equipment: prevEquipment }];
     updateLift(l.id, { sets: newSets });
   };
 
@@ -503,151 +690,227 @@ function LiftRowItem({ l, updateLift, removeLift }: LiftRowItemProps) {
     updateLift(l.id, { sets: newSets });
   };
 
+  const triggerDeleteLift = () => {
+    setIsDeleting(true);
+    setOffsetX(-600);
+    setTimeout(() => {
+      removeLift(l.id);
+    }, 250);
+  };
+
+  const handleTouchStart = (e: React.TouchEvent) => {
+    const target = e.target as HTMLElement;
+    if (target.closest("input, button, select, textarea, .suggestions-dropdown, .set-type-modal-backdrop, .swipe-set-outer")) {
+      touchStartXRef.current = null;
+      return;
+    }
+    touchStartXRef.current = e.touches[0].clientX;
+    touchStartYRef.current = e.touches[0].clientY;
+    isHorizontalRef.current = null;
+    setIsSwiping(true);
+  };
+
+  const handleTouchMove = (e: React.TouchEvent) => {
+    if (touchStartXRef.current === null) return;
+    const diffX = e.touches[0].clientX - touchStartXRef.current;
+    const diffY = e.touches[0].clientY - (touchStartYRef.current || 0);
+
+    if (isHorizontalRef.current === null) {
+      if (Math.abs(diffX) > 6 || Math.abs(diffY) > 6) {
+        isHorizontalRef.current = Math.abs(diffX) > Math.abs(diffY);
+      }
+    }
+
+    if (!isHorizontalRef.current) return;
+    if (diffX < 0) {
+      setOffsetX(diffX);
+    } else {
+      setOffsetX(0);
+    }
+  };
+
+  const handleTouchEnd = () => {
+    if (touchStartXRef.current === null) return;
+    touchStartXRef.current = null;
+    setIsSwiping(false);
+
+    if (offsetX < -90) {
+      triggerDeleteLift();
+    } else {
+      setOffsetX(0);
+    }
+  };
+
+  const handleMouseDown = (e: React.MouseEvent) => {
+    const target = e.target as HTMLElement;
+    if (target.closest("input, button, select, textarea, .suggestions-dropdown, .set-type-modal-backdrop, .swipe-set-outer")) {
+      return;
+    }
+    const startX = e.clientX;
+    setIsSwiping(true);
+
+    const onMouseMove = (moveEvent: MouseEvent) => {
+      const diffX = moveEvent.clientX - startX;
+      if (diffX < 0) {
+        setOffsetX(diffX);
+      } else {
+        setOffsetX(0);
+      }
+    };
+
+    const onMouseUp = (upEvent: MouseEvent) => {
+      window.removeEventListener("mousemove", onMouseMove);
+      window.removeEventListener("mouseup", onMouseUp);
+      setIsSwiping(false);
+      const diffX = upEvent.clientX - startX;
+      if (diffX < -90) {
+        triggerDeleteLift();
+      } else {
+        setOffsetX(0);
+      }
+    };
+
+    window.addEventListener("mousemove", onMouseMove);
+    window.addEventListener("mouseup", onMouseUp);
+  };
+
   return (
-    <div className="lift-item-wrapper" style={{ border: "1px solid var(--border)", borderRadius: "10px", padding: "12px", background: "var(--bg-elevated)", display: "flex", flexDirection: "column", gap: "10px" }}>
-      {/* Header Row */}
-      <div className="lift-header" style={{ display: "flex", alignItems: "center", gap: "12px" }}>
-        {/* GIF Box Thumbnail */}
-        <div className="lift-gif-box" style={{ width: "48px", height: "48px", borderRadius: "8px", border: "1px solid var(--border)", overflow: "hidden", display: "flex", alignItems: "center", justifyContent: "center", background: "#0a0b0d", flexShrink: 0 }}>
-          {l.gifUrl ? (
-            <img src={l.gifUrl} alt={l.name} style={{ width: "100%", height: "100%", objectFit: "cover" }} />
-          ) : (
-            <PlateIcon size={18} color="var(--chalk-dim)" />
-          )}
-        </div>
-
-        {/* Lift Name Input / Suggestion Box */}
-        <div style={{ position: "relative", flex: 1, minWidth: 0 }}>
-          <input
-            className="text-input lift-name"
-            placeholder="Barbell Bench Press"
-            value={query}
-            onChange={(e) => handleNameChange(e.target.value)}
-            onFocus={() => {
-              if (suggestions.length > 0) setShowDropdown(true);
-            }}
-            onBlur={() => {
-              setTimeout(() => setShowDropdown(false), 200);
-            }}
-            style={{ fontWeight: "700", fontSize: "16px", fontFamily: "Oswald, sans-serif", border: "none", background: "transparent", borderBottom: "1px solid transparent", borderRadius: "0", padding: "4px 0" }}
-          />
-          {showDropdown && suggestions.length > 0 && (
-            <div className="suggestions-dropdown" style={{ position: "absolute", top: "100%", left: 0, right: 0, background: "var(--bg-card)", border: "1px solid var(--border)", borderRadius: "0 0 7px 7px", zIndex: 10, maxHeight: "160px", overflowY: "auto", boxShadow: "0 4px 12px rgba(0,0,0,0.5)" }}>
-              {suggestions.map((s) => (
-                <div
-                  key={s.exerciseId}
-                  className="suggestion-item"
-                  onMouseDown={() => selectSuggestion(s.name, s.gifUrl)}
-                  style={{ padding: "8px 10px", fontSize: "12px", cursor: "pointer", color: "var(--chalk)", textTransform: "capitalize" }}
-                >
-                  {s.name}
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
-
-        {/* Header Actions */}
-        <div style={{ display: "flex", alignItems: "center", gap: "6px", flexShrink: 0 }}>
-          <select
-            className="text-input lift-unit"
-            value={l.unit || "kg"}
-            onChange={(e) => updateLift(l.id, { unit: e.target.value })}
-            style={{ width: "60px", padding: "4px 6px", fontSize: "12px", background: "var(--bg-card)", border: "1px solid var(--border)", borderRadius: "6px" }}
-          >
-            <option value="kg">kg</option>
-            <option value="lb">lb</option>
-          </select>
-          <button
-            type="button"
-            className="btn-ghost btn-sm"
-            onClick={addSet}
-            style={{ padding: "4px 8px", fontSize: "11px", height: "auto" }}
-          >
-            + Set
-          </button>
-          <button
-            type="button"
-            className="icon-btn"
-            onClick={() => removeLift(l.id)}
-            aria-label="Remove lift"
-            style={{ padding: "4px", display: "flex", alignItems: "center", justifyContent: "center" }}
-          >
-            ✕
-          </button>
-        </div>
+    <div
+      className="swipe-lift-container"
+      style={{
+        position: "relative",
+        borderRadius: "12px",
+        overflow: "hidden",
+        marginBottom: "10px",
+        maxHeight: isDeleting ? "0px" : "1000px",
+        opacity: isDeleting ? 0 : 1,
+        transition: isDeleting ? "all 0.25s cubic-bezier(0.16, 1, 0.3, 1)" : "none",
+      }}
+    >
+      {/* Red Background Behind Lift with Delete Label & Trash Icon */}
+      <div
+        onClick={triggerDeleteLift}
+        style={{
+          position: "absolute",
+          inset: 0,
+          background: "linear-gradient(90deg, #991b1b 0%, #ef4444 100%)",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "flex-end",
+          paddingRight: "22px",
+          gap: "8px",
+          color: "#ffffff",
+          fontWeight: 700,
+          fontSize: "13px",
+          borderRadius: "12px",
+          cursor: "pointer",
+        }}
+      >
+        <Trash2 size={20} />
+        <span>Delete Lift</span>
       </div>
 
-      {/* Sets List (Indented) */}
-      <div className="lift-sets-list" style={{ paddingLeft: "60px", display: "flex", flexDirection: "column", gap: "6px" }}>
-        {listSets.map((s) => (
-          <div key={s.id} className="set-row" style={{ display: "flex", alignItems: "center", gap: "8px" }}>
-            {/* Set Type selection */}
-            <select
-              className="text-input set-type"
-              value={s.type}
-              onChange={(e) => updateSet(s.id, { type: e.target.value })}
-              style={{ width: "45px", padding: "3px 4px", fontSize: "12px", background: "var(--bg-card)", border: "1px solid var(--border)", borderRadius: "6px", textAlign: "center", fontWeight: "bold", color: s.type === "W" ? "var(--brass)" : "var(--chalk)" }}
-            >
-              <option value="W">W</option>
-              {Array.from({ length: 15 }, (_, i) => String(i + 1)).map((num) => (
-                <option key={num} value={num}>
-                  {num}
-                </option>
-              ))}
-            </select>
-
-            {/* Weight Input */}
-            <input
-              className="text-input set-num"
-              type="number"
-              placeholder="Wt"
-              value={s.weight}
-              onChange={(e) => updateSet(s.id, { weight: e.target.value })}
-              style={{ width: "65px", padding: "4px 8px", fontSize: "12px", background: "var(--bg-card)", border: "1px solid var(--border)", borderRadius: "6px" }}
-            />
-            <span style={{ fontSize: "11px", color: "var(--chalk-dim)" }}>{l.unit || "kg"}</span>
-
-            <span style={{ color: "var(--chalk-dim)", fontSize: "12px" }}>×</span>
-
-            {/* Reps Input */}
-            <input
-              className="text-input set-num"
-              type="number"
-              placeholder="Reps"
-              value={s.reps}
-              onChange={(e) => updateSet(s.id, { reps: e.target.value })}
-              style={{ width: "55px", padding: "4px 8px", fontSize: "12px", background: "var(--bg-card)", border: "1px solid var(--border)", borderRadius: "6px" }}
-            />
-            <span style={{ fontSize: "11px", color: "var(--chalk-dim)" }}>Reps</span>
-
-            {/* PR Checkbox */}
-            <label className="pr-check" style={{ marginLeft: "8px", display: "flex", alignItems: "center", gap: "4px", fontSize: "11px", color: "var(--chalk-dim)", cursor: "pointer" }}>
-              <input
-                type="checkbox"
-                checked={s.isPR}
-                onChange={(e) => updateSet(s.id, { isPR: e.target.checked })}
-                style={{ cursor: "pointer" }}
-              />
-              PR
-            </label>
-
-            <div style={{ flex: 1 }} />
-
-            {/* Remove Set */}
-            {listSets.length > 1 && (
-              <button
-                type="button"
-                className="icon-btn"
-                onClick={() => removeSet(s.id)}
-                aria-label="Remove set"
-                style={{ padding: "2px 6px", fontSize: "11px" }}
-              >
-                ✕
-              </button>
+      {/* Foreground Lift Card */}
+      <div
+        className="lift-item-wrapper"
+        onTouchStart={handleTouchStart}
+        onTouchMove={handleTouchMove}
+        onTouchEnd={handleTouchEnd}
+        onMouseDown={handleMouseDown}
+        style={{
+          position: "relative",
+          zIndex: 2,
+          border: "1px solid var(--border)",
+          borderRadius: "12px",
+          padding: "12px",
+          background: "var(--bg-elevated, #1a1e26)",
+          display: "flex",
+          flexDirection: "column",
+          gap: "10px",
+          transform: `translateX(${offsetX}px)`,
+          transition: isSwiping ? "none" : "transform 0.22s cubic-bezier(0.16, 1, 0.3, 1)",
+          boxShadow: offsetX < 0 ? "-6px 0 20px rgba(0,0,0,0.5)" : "none",
+          touchAction: "pan-y",
+        }}
+      >
+        {/* Header Row */}
+        <div className="lift-header" style={{ display: "flex", alignItems: "center", gap: "12px" }}>
+          {/* GIF Box Thumbnail */}
+          <div className="lift-gif-box" style={{ width: "48px", height: "48px", borderRadius: "8px", border: "1px solid var(--border)", overflow: "hidden", display: "flex", alignItems: "center", justifyContent: "center", background: "#0a0b0d", flexShrink: 0 }}>
+            {l.gifUrl ? (
+              <img src={l.gifUrl} alt={l.name} style={{ width: "100%", height: "100%", objectFit: "cover" }} />
+            ) : (
+              <PlateIcon size={18} color="var(--chalk-dim)" />
             )}
           </div>
-        ))}
+
+          {/* Lift Name Input / Suggestion Box */}
+          <div style={{ position: "relative", flex: 1, minWidth: 0 }}>
+            <input
+              className="text-input lift-name"
+              placeholder="Barbell Bench Press"
+              value={query}
+              onChange={(e) => handleNameChange(e.target.value)}
+              onFocus={() => {
+                if (suggestions.length > 0) setShowDropdown(true);
+              }}
+              onBlur={() => {
+                setTimeout(() => setShowDropdown(false), 200);
+              }}
+              style={{ fontWeight: "700", fontSize: "16px", fontFamily: "Oswald, sans-serif", border: "none", background: "transparent", borderBottom: "1px solid transparent", borderRadius: "0", padding: "4px 0" }}
+            />
+            {showDropdown && suggestions.length > 0 && (
+              <div className="suggestions-dropdown" style={{ position: "absolute", top: "100%", left: 0, right: 0, background: "var(--bg-card)", border: "1px solid var(--border)", borderRadius: "0 0 7px 7px", zIndex: 10, maxHeight: "160px", overflowY: "auto", boxShadow: "0 4px 12px rgba(0,0,0,0.5)" }}>
+                {suggestions.map((s) => (
+                  <div
+                    key={s.exerciseId}
+                    className="suggestion-item"
+                    onMouseDown={() => selectSuggestion(s.name, s.gifUrl)}
+                    style={{ padding: "8px 10px", fontSize: "12px", cursor: "pointer", color: "var(--chalk)", textTransform: "capitalize" }}
+                  >
+                    {s.name}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
+          {/* Header Actions (Cross mark removed, now swipe left to delete) */}
+          <div style={{ display: "flex", alignItems: "center", gap: "6px", flexShrink: 0 }}>
+            <select
+              className="text-input lift-unit"
+              value={l.unit || "kg"}
+              onChange={(e) => updateLift(l.id, { unit: e.target.value })}
+              style={{ width: "60px", padding: "4px 6px", fontSize: "12px", background: "var(--bg-card)", border: "1px solid var(--border)", borderRadius: "6px" }}
+            >
+              <option value="kg">kg</option>
+              <option value="lb">lb</option>
+            </select>
+            <button
+              type="button"
+              className="btn-ghost btn-sm"
+              onClick={addSet}
+              style={{ padding: "4px 8px", fontSize: "11px", height: "auto" }}
+            >
+              + Set
+            </button>
+          </div>
+        </div>
+
+        {/* Sets List (Indented with SwipeableSetRows) */}
+        <div className="lift-sets-list" style={{ paddingLeft: "60px", display: "flex", flexDirection: "column", gap: "6px" }}>
+          {listSets.map((s) => (
+            <SwipeableSetRow
+              key={s.id}
+              s={s}
+              unit={l.unit}
+              listSetsLength={listSets.length}
+              onOpenTypeModal={() => onOpenSetTypeModal(l.id, s.id)}
+              updateSet={updateSet}
+              removeSet={removeSet}
+            />
+          ))}
+        </div>
       </div>
     </div>
   );
@@ -655,14 +918,30 @@ function LiftRowItem({ l, updateLift, removeLift }: LiftRowItemProps) {
 
 
 
-function DayModal({ day, phaseColor, onClose, onSave, onDelete, onUpdateDraft, onGoToExerciseLibrary }: {
-  day: DayEntry; phaseColor: string; onClose: () => void; onSave: (d: DayEntry) => void; onDelete: (id: string) => void; onUpdateDraft: (d: DayEntry) => void; onGoToExerciseLibrary: () => void;
+function DayModal({ day, phaseColor, onClose, onSave, onDelete, onDiscard, onUpdateDraft, onGoToExerciseLibrary, onPerformAgain, initialEditMode = false, isLive = false }: {
+  day: DayEntry; phaseColor: string; onClose: () => void; onSave: (d: DayEntry) => void; onDelete: (id: string) => void; onDiscard?: () => void; onUpdateDraft: (d: DayEntry) => void; onGoToExerciseLibrary: () => void;
+  onPerformAgain?: (d: DayEntry) => void;
+  initialEditMode?: boolean;
+  isLive?: boolean;
 }) {
   const [type, setType] = useState(day.type === "empty" ? "workout" : day.type);
   const [title, setTitle] = useState(day.title);
   const [bodyTags, setBodyTags] = useState(day.bodyTags || []);
   const [lifts, setLifts] = useState<LiftEntry[]>(day.lifts && day.lifts.length ? day.lifts : []);
   const [notes, setNotes] = useState(day.notes || "");
+  const [elapsedSeconds, setElapsedSeconds] = useState<number>(day.durationSeconds || 0);
+  const [activeSetTypeModalInfo, setActiveSetTypeModalInfo] = useState<{
+    liftId: string;
+    setId: string;
+  } | null>(null);
+  const [activeInfo, setActiveInfo] = useState<string | null>(null);
+
+  const hasExistingData = day.type !== "empty" && ((day.lifts && day.lifts.length > 0) || (day.title && day.title.trim().length > 0));
+  const [isEditMode, setIsEditMode] = useState<boolean>(initialEditMode || !hasExistingData);
+  const [isMenuOpen, setIsMenuOpen] = useState(false);
+  const [isFavorite, setIsFavorite] = useState(false);
+  const [shareToast, setShareToast] = useState(false);
+  const [showDiscardConfirm, setShowDiscardConfirm] = useState(false);
 
   useEffect(() => {
     setType(day.type === "empty" ? "workout" : day.type);
@@ -670,7 +949,126 @@ function DayModal({ day, phaseColor, onClose, onSave, onDelete, onUpdateDraft, o
     setBodyTags(day.bodyTags || []);
     setLifts(day.lifts && day.lifts.length ? day.lifts : []);
     setNotes(day.notes || "");
-  }, [day]);
+    setElapsedSeconds(day.durationSeconds || 0);
+    const exists = day.type !== "empty" && ((day.lifts && day.lifts.length > 0) || (day.title && day.title.trim().length > 0));
+    setIsEditMode(Boolean(initialEditMode) || !exists);
+    setIsMenuOpen(false);
+    setShowDiscardConfirm(false);
+  }, [day, initialEditMode]);
+
+  const handleCancelClick = () => {
+    if (isEditMode) {
+      setShowDiscardConfirm(true);
+    } else {
+      onClose();
+    }
+  };
+
+  const handleConfirmDiscard = () => {
+    setShowDiscardConfirm(false);
+    if (onDiscard) {
+      onDiscard();
+    } else {
+      onClose();
+    }
+  };
+
+  useEffect(() => {
+    // Only tick live timer during an active live workout session.
+    // Finished/saved workout sessions display their recorded time statically without ticking!
+    if (type !== 'workout' || !isLive) return;
+    const interval = setInterval(() => {
+      setElapsedSeconds((prev) => prev + 1);
+    }, 1000);
+    return () => clearInterval(interval);
+  }, [type, isLive]);
+
+  const totalSets = useMemo(() => {
+    return (lifts || []).reduce((acc, lift) => acc + (Array.isArray(lift.sets) ? lift.sets.length : 0), 0);
+  }, [lifts]);
+
+  const totalVolume = useMemo(() => {
+    return (lifts || []).reduce((acc, lift) => {
+      const sets = Array.isArray(lift.sets) ? lift.sets : [];
+      const liftVol = sets.reduce((sum, s) => {
+        const w = parseFloat(String(s.weight)) || 0;
+        const r = parseFloat(String(s.reps)) || 0;
+        return sum + (w * r);
+      }, 0);
+      return acc + liftVol;
+    }, 0);
+  }, [lifts]);
+
+  const formatTimer = (totalSecs: number) => {
+    const hrs = Math.floor(totalSecs / 3600);
+    const mins = Math.floor((totalSecs % 3600) / 60);
+    const secs = totalSecs % 60;
+    if (hrs > 0) {
+      return `${String(hrs).padStart(2, '0')}:${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+    }
+    return `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+  };
+
+  useEffect(() => {
+    try {
+      const favs = JSON.parse(localStorage.getItem("iron_favorite_workouts") || "[]");
+      setIsFavorite(Array.isArray(favs) && favs.includes(day.id));
+    } catch {
+      setIsFavorite(false);
+    }
+  }, [day.id]);
+
+  const toggleFavorite = () => {
+    try {
+      const favs: string[] = JSON.parse(localStorage.getItem("iron_favorite_workouts") || "[]");
+      let updated: string[];
+      if (favs.includes(day.id)) {
+        updated = favs.filter((id) => id !== day.id);
+        setIsFavorite(false);
+      } else {
+        updated = [...favs, day.id];
+        setIsFavorite(true);
+      }
+      localStorage.setItem("iron_favorite_workouts", JSON.stringify(updated));
+    } catch (e) {
+      console.error(e);
+    }
+    setIsMenuOpen(false);
+  };
+
+  const handleShare = () => {
+    const lines = [
+      `🏋️ ${title || "Workout Session"}`,
+      `📅 ${fmtDateFull(day.date)}`,
+      type === "workout" && elapsedSeconds > 0 ? `⏱ Duration: ${formatTimer(elapsedSeconds)}` : "",
+      type === "workout" ? `📊 Volume: ${totalVolume.toLocaleString()} kg · ${totalSets} sets` : "",
+      bodyTags.length > 0 ? `🎯 Focus: ${bodyTags.join(", ")}` : "",
+      "",
+      ...lifts.map((l) => {
+        const setsText = (l.sets || [])
+          .map((s) => `${s.weight || 0}${l.unit || "kg"} × ${s.reps || 0} (${s.equipment === 'gear' ? 'Gear' : 'Raw'})`)
+          .join(", ");
+        return `• ${l.name}: ${setsText}`;
+      }),
+      notes ? `\n📝 Notes: ${notes}` : "",
+    ].filter(Boolean);
+
+    const text = lines.join("\n");
+    if (navigator.clipboard) {
+      navigator.clipboard.writeText(text).then(() => {
+        setShareToast(true);
+        setTimeout(() => setShareToast(false), 2500);
+      });
+    }
+    setIsMenuOpen(false);
+  };
+
+  const handlePerformAgain = () => {
+    setIsMenuOpen(false);
+    if (onPerformAgain) {
+      onPerformAgain(day);
+    }
+  };
 
   const toggleTag = (tag: string) =>
     setBodyTags((t) => (t.includes(tag) ? t.filter((x) => x !== tag) : [...t, tag]));
@@ -688,6 +1086,7 @@ function DayModal({ day, phaseColor, onClose, onSave, onDelete, onUpdateDraft, o
       bodyTags,
       lifts: cleanLifts,
       notes: notes.trim(),
+      durationSeconds: type === "workout" ? elapsedSeconds : 0,
     };
     onUpdateDraft(updatedDraft);
     onGoToExerciseLibrary();
@@ -702,570 +1101,775 @@ function DayModal({ day, phaseColor, onClose, onSave, onDelete, onUpdateDraft, o
       bodyTags,
       lifts: cleanLifts,
       notes: notes.trim(),
+      durationSeconds: type === "workout" ? elapsedSeconds : 0,
     });
   };
 
   return (
-    <div className="modal-backdrop" onClick={onClose}>
-      <div className="modal" onClick={(e) => e.stopPropagation()} style={{ "--phase": phaseColor } as React.CSSProperties}>
-        <div className="modal-header">
-          <div>
-            <div className="modal-date">{fmtDateFull(day.date)}</div>
-          </div>
-          <button className="icon-btn" onClick={onClose} aria-label="Close">✕</button>
-        </div>
-
-        <div className="modal-body">
-          <div className="field-row">
-            <label className="field-label">Type</label>
-            <div className="type-pills">
-              {Object.entries(DAY_TYPES)
-                .filter(([k]) => k !== "empty")
-                .map(([k, v]) => (
-                  <button
-                    key={k}
-                    className={`pill ${type === k ? "pill-active" : ""}`}
-                    onClick={() => setType(k)}
-                  >
-                    {v.label}
-                  </button>
-                ))}
-            </div>
-          </div>
-
-          <div className="field-row">
-            <label className="field-label" htmlFor="title-input">Title</label>
-            <input
-              id="title-input"
-              className="text-input"
-              placeholder={type === "workout" ? "e.g. Bench press + tricep" : "e.g. Feeling drained"}
-              value={title}
-              onChange={(e) => setTitle(e.target.value)}
-            />
-          </div>
-
-          {type === "workout" && (
-            <>
-              <div className="field-row">
-                <label className="field-label">Body focus</label>
-                <div className="type-pills">
-                  {BODY_TAGS.map((tag) => (
-                    <button
-                      key={tag}
-                      className={`pill pill-sm ${bodyTags.includes(tag) ? "pill-active" : ""}`}
-                      onClick={() => toggleTag(tag)}
-                    >
-                      {tag}
-                    </button>
-                  ))}
-                </div>
-              </div>
-
-              <div className="field-row">
-                <label className="field-label">Lifts</label>
-                <div className="lift-table" style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
-                  {lifts.map((l) => (
-                    <LiftRowItem
-                      key={l.id}
-                      l={l}
-                      updateLift={updateLift}
-                      removeLift={removeLift}
-                    />
-                  ))}
-
-                  <button className="add-lift-btn" type="button" onClick={handleAddLiftClick}>+ Add lift</button>
-                </div>
-              </div>
-            </>
-          )}
-
-          <div className="field-row">
-            <label className="field-label" htmlFor="notes-input">Notes</label>
-            <textarea
-              id="notes-input"
-              className="text-input textarea"
-              rows={3}
-              value={notes}
-              onChange={(e) => setNotes(e.target.value)}
-            />
-          </div>
-        </div>
-
-        <div className="modal-footer">
-          {day.type !== "empty" && (
-            <button className="btn-ghost" onClick={() => onDelete(day.id)}>Clear day</button>
-          )}
-          <div className="spacer" />
-          <button className="btn-ghost" onClick={onClose}>Cancel</button>
-          <button className="btn-primary" onClick={handleSave}>Save entry</button>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-/* ---------------- Day card ---------------- */
-
-function DayCard({ day, phaseColor, isToday, onClick }: {
-  day: DayEntry; phaseColor: string; isToday: boolean; onClick: () => void;
-}) {
-  const meta = DAY_TYPES[day.type] || DAY_TYPES.empty;
-  const hasPR = day.lifts && day.lifts.some((l) => Array.isArray(l.sets) && l.sets.some((s) => s.isPR));
-  return (
-    <button
-      className={`day-card ${day.type === "empty" ? "day-empty" : ""} ${isToday ? "day-today" : ""}`}
-      style={{
-        "--day-color": day.type === "workout" ? phaseColor : meta.color,
-      } as React.CSSProperties}
-      onClick={onClick}
-    >
-      <div className="day-card-top">
-        <span className="day-weekday">{fmtDate(day.date).split(" ")[0]}</span>
-        <span className="day-num">{fmtDate(day.date).split(" ")[2]}</span>
-        {hasPR && <span className="pr-flag">PR</span>}
-      </div>
-      <div className="day-title">{day.title || (day.type === "empty" ? "" : meta.label)}</div>
-      {day.bodyTags && day.bodyTags.length > 0 && (
-        <div className="day-tags">{day.bodyTags.slice(0, 2).join(" · ")}</div>
-      )}
-    </button>
-  );
-}
-
-/* ---------------- Microcycle row ---------------- */
-
-function MicrocycleRow({ mic, phaseColor, onDayClick, today, onDeleteMicrocycle, onRenameMicrocycle }: {
-  mic: Microcycle; phaseColor: string; onDayClick: (d: DayEntry) => void; today: string;
-  onDeleteMicrocycle: (id: string) => void; onRenameMicrocycle: (id: string, newLabel: string) => void;
-}) {
-  const [isEditingLabel, setIsEditingLabel] = useState(false);
-  const [tempLabel, setTempLabel] = useState(mic.label || "");
-
-  useEffect(() => {
-    setTempLabel(mic.label || "");
-  }, [mic.id, mic.label]);
-
-  const handleSave = () => {
-    setIsEditingLabel(false);
-    onRenameMicrocycle(mic.id, tempLabel.trim());
-  };
-
-  return (
-    <div className="microcycle-row">
-      <div className="microcycle-label" style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-        <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
-          <span className="mc-index">MC{mic.index}</span>
-          {isEditingLabel ? (
-            <input
-              className="text-input"
-              value={tempLabel}
-              onChange={(e) => setTempLabel(e.target.value)}
-              onBlur={handleSave}
-              onKeyDown={(e) => {
-                if (e.key === "Enter") handleSave();
-                else if (e.key === "Escape") {
-                  setIsEditingLabel(false);
-                  setTempLabel(mic.label || "");
-                }
+    <>
+      <div className="modal-backdrop" onClick={handleCancelClick}>
+        <div className="modal" onClick={(e) => e.stopPropagation()} style={{ "--phase": phaseColor, position: "relative" } as React.CSSProperties}>
+          
+          {/* Share toast */}
+          {shareToast && (
+            <div
+              style={{
+                position: "absolute",
+                top: "16px",
+                left: "50%",
+                transform: "translateX(-50%)",
+                background: "#059669",
+                color: "#ffffff",
+                fontSize: "12px",
+                fontWeight: 700,
+                padding: "6px 16px",
+                borderRadius: "20px",
+                boxShadow: "0 4px 16px rgba(0,0,0,0.5)",
+                zIndex: 1100,
+                pointerEvents: "none",
               }}
-              autoFocus
-              placeholder="Label"
-              style={{ width: "100px", padding: "2px 6px", fontSize: "11px", height: "22px", background: "var(--bg-card)", border: "1px solid var(--border)", borderRadius: "4px" }}
-            />
-          ) : (
-            mic.label && <span className="mc-tag">{mic.label}</span>
+            >
+              ✓ Workout copied to clipboard!
+            </div>
           )}
-        </div>
-        <div style={{ display: "flex", alignItems: "center", gap: "4px" }}>
-          <button
-            className="action-icon-btn"
-            onClick={() => setIsEditingLabel(true)}
-            title="Rename Microcycle"
-            type="button"
-          >
-            <Pencil size={11} />
-          </button>
-          <button
-            className="action-icon-btn action-icon-btn-danger"
-            onClick={() => onDeleteMicrocycle(mic.id)}
-            title="Delete Microcycle"
-            type="button"
-          >
-            <Trash2 size={11} />
-          </button>
-        </div>
-      </div>
-      <div className="day-grid">
-        {mic.days.map((day) => (
-          <DayCard
-            key={day.id}
-            day={day}
-            phaseColor={phaseColor}
-            isToday={day.date === today}
-            onClick={() => onDayClick(day)}
-          />
-        ))}
-      </div>
-    </div>
-  );
-}
 
-/* ---------------- Add microcycle inline ---------------- */
-
-function AddMicrocycleButton({ meso, onAdd }: { meso: Mesocycle; onAdd: (mic: Microcycle) => void }) {
-  const [open, setOpen] = useState(false);
-  const [length, setLength] = useState<number | "">(7);
-  const [label, setLabel] = useState("");
-
-  const lastDay = meso.microcycles.length
-    ? meso.microcycles[meso.microcycles.length - 1].days.slice(-1)[0].date
-    : meso.start;
-  const nextStart = meso.microcycles.length ? addDays(lastDay, 1) : meso.start;
-  const nextIndex = meso.microcycles.length
-    ? meso.microcycles[meso.microcycles.length - 1].index + 1
-    : parseInt(meso.micRange.split(/[–-]/)[0], 10) || 1;
-
-  if (!open) {
-    return (
-      <button className="add-mc-btn" onClick={() => setOpen(true)}>
-        + Add microcycle
-      </button>
-    );
-  }
-
-  return (
-    <div className="add-mc-form">
-      <span className="add-mc-hint">MC{nextIndex} starts {fmtDateShort(nextStart)}</span>
-      <input
-        className="text-input lift-num"
-        type="number"
-        min={1}
-        max={21}
-        value={length}
-        onChange={(e) => {
-          const val = e.target.value;
-          setLength(val === "" ? "" : parseInt(val, 10));
-        }}
-      />
-      <span className="add-mc-hint">days</span>
-      <input
-        className="text-input"
-        style={{ width: 120 }}
-        placeholder="Label (optional)"
-        value={label}
-        onChange={(e) => setLabel(e.target.value)}
-      />
-      <button
-        className="btn-primary btn-sm"
-        onClick={() => {
-          const finalLength = length === "" ? 7 : Number(length);
-          const [built] = buildMicrocycles(nextStart, [{ index: nextIndex, length: finalLength, label: label || null }]);
-          onAdd(built);
-          setOpen(false);
-          setLength(7);
-          setLabel("");
-        }}
-      >
-        Add
-      </button>
-      <button className="btn-ghost btn-sm" onClick={() => setOpen(false)}>Cancel</button>
-    </div>
-  );
-}
-
-/* ---------------- Edit mesocycle modal ---------------- */
-
-function EditMesocycleModal({
-  meso,
-  macrocycles,
-  onClose,
-  onSave,
-}: {
-  meso: Mesocycle;
-  macrocycles: Macrocycle[];
-  onClose: () => void;
-  onSave: (updates: { name: string; phaseKey: string; start: string; macroId: string }) => void;
-}) {
-  const [name, setName] = useState(meso.name);
-  const [phaseKey, setPhaseKey] = useState(meso.phaseKey);
-  const [start, setStart] = useState(meso.start);
-  const [macroId, setMacroId] = useState(meso.macroId);
-
-  return (
-    <div className="modal-backdrop" onClick={onClose}>
-      <div
-        className="modal"
-        onClick={(e) => e.stopPropagation()}
-        style={{ "--phase": PHASES[phaseKey]?.color || "#C1432E" } as React.CSSProperties}
-      >
-        <div className="modal-header">
-          <div className="modal-date">Edit Mesocycle — {meso.name}</div>
-          <button className="icon-btn" onClick={onClose}>✕</button>
-        </div>
-
-        <div className="modal-body">
-          <div className="field-row">
-            <label className="field-label">Mesocycle Name</label>
-            <input
-              className="text-input"
-              value={name}
-              onChange={(e) => setName(e.target.value)}
-              placeholder="e.g. Peaking Block 1"
-            />
-          </div>
-
-          <div className="field-row">
-            <label className="field-label">Phase</label>
-            <div className="type-pills">
-              {Object.entries(PHASES).map(([k, v]) => (
-                <button
-                  key={k}
-                  type="button"
-                  className={`pill ${phaseKey === k ? "pill-active" : ""}`}
-                  style={phaseKey === k ? { borderColor: v.color, color: "#fff" } : {}}
-                  onClick={() => setPhaseKey(k)}
-                >
-                  {v.label}
-                </button>
-              ))}
+          {/* Modal Header */}
+          <div className="modal-header" style={{ position: "relative" }}>
+            <div style={{ display: "flex", alignItems: "center", gap: "10px", minWidth: 0, flex: 1 }}>
+              <div className="modal-date">{fmtDateFull(day.date)}</div>
+              {isFavorite && (
+                <span title="Favorite Workout" style={{ color: "#fbbf24", display: "inline-flex", alignItems: "center" }}>
+                  <Star size={15} fill="#fbbf24" />
+                </span>
+              )}
             </div>
-          </div>
 
-          <div className="field-row">
-            <label className="field-label">Start Date</label>
-            <input
-              type="date"
-              className="text-input"
-              value={start}
-              onChange={(e) => setStart(e.target.value)}
-            />
-          </div>
-
-          <div className="field-row">
-            <label className="field-label">Macrocycle</label>
-            <div className="type-pills">
-              {macrocycles.map((m) => (
-                <button
-                  key={m.id}
-                  type="button"
-                  className={`pill ${macroId === m.id ? "pill-active" : ""}`}
-                  onClick={() => setMacroId(m.id)}
-                >
-                  {m.name}
-                </button>
-              ))}
-            </div>
-          </div>
-        </div>
-
-        <div className="modal-footer">
-          <button className="btn-ghost" onClick={onClose}>Cancel</button>
-          <button
-            className="btn-primary"
-            onClick={() => {
-              if (!name.trim()) return;
-              onSave({ name: name.trim(), phaseKey, start, macroId });
-              onClose();
-            }}
-          >
-            Save Mesocycle
-          </button>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-/* ---------------- Mesocycle detail ---------------- */
-
-function MesoDetail({ meso, macrocycles, onDayClick, onAddMicrocycle, today, onDeleteMeso, onDeleteMicrocycle, onUpdateMeso, onRenameMicrocycle }: {
-  meso: Mesocycle; macrocycles: Macrocycle[]; onDayClick: (d: DayEntry) => void; onAddMicrocycle: (mic: Microcycle) => void; today: string;
-  onDeleteMeso: (id: string) => void; onDeleteMicrocycle: (micId: string) => void;
-  onUpdateMeso: (id: string, updates: { name: string; phaseKey: string; start: string; macroId: string }) => void;
-  onRenameMicrocycle: (id: string, newLabel: string) => void;
-}) {
-  const phase = PHASES[meso.phaseKey] || PHASES.Peaking;
-  const [editingMeso, setEditingMeso] = useState(false);
-
-  return (
-    <div className="meso-detail" style={{ "--phase": phase.color } as React.CSSProperties}>
-      <div className="meso-detail-header">
-        <div>
-          <div className="meso-eyebrow">
-            Mesocycle {meso.index} · MC {meso.micRange} · {phase.label}
-          </div>
-          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: "16px" }}>
-            <h2 className="meso-title">{meso.name}</h2>
             <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+              {/* 3-dots Menu Button ':' */}
               <button
-                className="action-icon-btn"
-                onClick={() => setEditingMeso(true)}
-                title="Edit Mesocycle (Name, Phase, Dates, Macrocycle)"
                 type="button"
+                className="icon-btn"
+                onClick={() => setIsMenuOpen(true)}
+                title="Workout Session Options"
+                aria-label="Workout Session Options"
+                style={{
+                  padding: "6px 8px",
+                  borderRadius: "8px",
+                  background: isMenuOpen ? "rgba(255,255,255,0.12)" : "transparent",
+                  color: isMenuOpen ? "#ffffff" : "var(--chalk-dim)",
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                }}
               >
-                <Pencil size={13} />
+                <MoreVertical size={18} />
               </button>
-              <button
-                className="action-icon-btn action-icon-btn-danger"
-                onClick={() => onDeleteMeso(meso.id)}
-                title="Delete Mesocycle"
-                type="button"
-              >
-                <Trash2 size={13} />
-              </button>
+
+              {/* Close Button */}
+              <button className="icon-btn" onClick={handleCancelClick} aria-label="Close">✕</button>
             </div>
           </div>
-          <div className="meso-dates">
-            {fmtDateShort(meso.start)} — {fmtDateShort(meso.end)}
-            <span className={`status-badge status-${meso.status}`}>{meso.status}</span>
-          </div>
-        </div>
-      </div>
 
-      {meso.microcycles.length === 0 ? (
-        <div className="meso-empty">
-          No microcycles logged for this block yet.
-        </div>
-      ) : (
-        meso.microcycles.map((mic) => (
-          <MicrocycleRow key={mic.id} mic={mic} phaseColor={phase.color} onDayClick={onDayClick} today={today} onDeleteMicrocycle={onDeleteMicrocycle} onRenameMicrocycle={onRenameMicrocycle} />
-        ))
-      )}
+          <div className="modal-body">
+            {!isEditMode ? (
+              /* Non-Editable / Read-Only View */
+              <div style={{ display: "flex", flexDirection: "column", gap: "16px" }}>
+                {/* Title and tags */}
+                <div>
+                  <h2 style={{ fontSize: "20px", fontWeight: 700, color: "#ffffff", margin: 0, fontFamily: "Oswald, sans-serif", display: "flex", alignItems: "center", gap: "8px" }}>
+                    {type === "recovery" && <BatteryCharging size={20} className="text-sky-400" style={{ color: "#38bdf8" }} />}
+                    {["event", "illness", "note"].includes(type) && <AlertCircle size={20} className="text-rose-400" style={{ color: "#ef4444" }} />}
+                    <span>{title || (type === "recovery" ? "Recovery" : type !== "workout" && type !== "empty" ? type.charAt(0).toUpperCase() + type.slice(1) : "Workout Session")}</span>
+                  </h2>
+                  {bodyTags && bodyTags.length > 0 && (
+                    <div style={{ display: "flex", gap: "6px", flexWrap: "wrap", marginTop: "8px" }}>
+                      {bodyTags.map((tag) => (
+                        <span key={tag} className="pill pill-sm" style={{ cursor: "default", opacity: 0.9 }}>
+                          {tag}
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                </div>
 
-      <AddMicrocycleButton meso={meso} onAdd={onAddMicrocycle} />
+                {/* Compact Live Workout Stats Bar */}
+                {type === "workout" && (
+                  <div className="workout-live-stats-bar">
+                    <div className="workout-live-stat-card">
+                      <div className="workout-stat-header">
+                        <Timer size={11} className="text-emerald-400 flex-shrink-0" />
+                        <span className="workout-stat-label">Time</span>
+                      </div>
+                      <div className="workout-stat-value text-emerald-400">
+                        {formatTimer(elapsedSeconds)}
+                      </div>
+                    </div>
 
-      {editingMeso && (
-        <EditMesocycleModal
-          meso={meso}
-          macrocycles={macrocycles}
-          onClose={() => setEditingMeso(false)}
-          onSave={(updates) => onUpdateMeso(meso.id, updates)}
-        />
-      )}
-    </div>
-  );
-}
+                    <div className="workout-live-stat-card">
+                      <div className="workout-stat-header">
+                        <Dumbbell size={11} className="text-sky-400 flex-shrink-0" />
+                        <span className="workout-stat-label">Volume</span>
+                      </div>
+                      <div className="workout-stat-value text-sky-400">
+                        {totalVolume.toLocaleString()}<span className="workout-stat-unit">kg</span>
+                      </div>
+                    </div>
 
-/* ---------------- Macrocycle timeline (sidebar) ---------------- */
-
-function MacroTimeline({ macrocycles, mesocycles, selectedId, onSelect, onAddMacro, onAddMeso, onDeleteMacro, onRenameMacro }: {
-  macrocycles: Macrocycle[]; mesocycles: Mesocycle[]; selectedId: string | null;
-  onSelect: (id: string) => void; onAddMacro: () => void; onAddMeso: (macroId: string) => void;
-  onDeleteMacro: (id: string) => void; onRenameMacro: (id: string, name: string) => void;
-}) {
-  const [isOpen, setIsOpen] = useState(false);
-  const selectedMeso = mesocycles.find((m) => m.id === selectedId);
-  const [editingMacroId, setEditingMacroId] = useState<string | null>(null);
-  const [tempMacroName, setTempMacroName] = useState("");
-
-  const handleSaveMacroName = (macroId: string) => {
-    setEditingMacroId(null);
-    if (tempMacroName.trim() && tempMacroName.trim() !== (macrocycles.find((m) => m.id === macroId)?.name || "")) {
-      onRenameMacro(macroId, tempMacroName.trim());
-    }
-  };
-
-  return (
-    <div className={`timeline ${isOpen ? "timeline-open" : "timeline-collapsed"}`}>
-      <button
-        className="timeline-mobile-toggle"
-        onClick={() => setIsOpen(!isOpen)}
-        type="button"
-      >
-        <span>
-          {isOpen ? "Hide Timeline & Blocks ✕" : `📋 Show Timeline & Blocks (Selected: ${selectedMeso ? selectedMeso.name : "None"}) ▾`}
-        </span>
-      </button>
-      <div className="timeline-content">
-        {macrocycles.map((macro) => {
-          const group = mesocycles.filter((m) => m.macroId === macro.id);
-          const isEditing = editingMacroId === macro.id;
-
-          return (
-            <div className="macro-group" key={macro.id}>
-              <div className="timeline-heading" style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                {isEditing ? (
-                  <input
-                    className="text-input"
-                    value={tempMacroName}
-                    onChange={(e) => setTempMacroName(e.target.value)}
-                    onBlur={() => handleSaveMacroName(macro.id)}
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter") handleSaveMacroName(macro.id);
-                      else if (e.key === "Escape") setEditingMacroId(null);
-                    }}
-                    autoFocus
-                    style={{ fontSize: "12px", padding: "2px 6px", width: "140px", background: "var(--bg-card)", border: "1px solid var(--border)", borderRadius: "4px" }}
-                  />
-                ) : (
-                  <div>
-                    {macro.name}
-                    <span className="macro-heading-range"> · from {fmtDateShort(macro.start)}</span>
+                    <div className="workout-live-stat-card">
+                      <div className="workout-stat-header">
+                        <Layers size={11} className="text-amber-400 flex-shrink-0" />
+                        <span className="workout-stat-label">Sets</span>
+                      </div>
+                      <div className="workout-stat-value text-amber-400">
+                        {totalSets}<span className="workout-stat-unit">sets</span>
+                      </div>
+                    </div>
                   </div>
                 )}
-                <div style={{ display: "flex", alignItems: "center", gap: "4px" }}>
-                  <button
-                    className="action-icon-btn"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      setEditingMacroId(macro.id);
-                      setTempMacroName(macro.name);
-                    }}
-                    title="Rename Macrocycle"
-                    type="button"
-                    style={{ padding: "4px" }}
-                  >
-                    <Pencil size={11} />
-                  </button>
-                  <button
-                    className="action-icon-btn action-icon-btn-danger"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      onDeleteMacro(macro.id);
-                    }}
-                    title="Delete Macrocycle"
-                    type="button"
-                    style={{ padding: "4px" }}
-                  >
-                    <Trash2 size={11} />
-                  </button>
+
+                {/* Non-Editable Lifts View */}
+                <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
+                  {lifts.length === 0 ? (
+                    <div style={{ color: "var(--chalk-dim)", fontStyle: "italic", padding: "16px 0" }}>
+                      No exercises in this session.
+                    </div>
+                  ) : (
+                    lifts.map((l) => (
+                      <div
+                        key={l.id}
+                        style={{
+                          border: "1px solid var(--border)",
+                          borderRadius: "10px",
+                          padding: "12px",
+                          background: "var(--bg-elevated)",
+                          display: "flex",
+                          flexDirection: "column",
+                          gap: "8px",
+                        }}
+                      >
+                        {/* Lift Name & Thumbnail */}
+                        <div style={{ display: "flex", alignItems: "center", gap: "12px" }}>
+                          <div style={{ width: "42px", height: "42px", borderRadius: "8px", border: "1px solid var(--border)", overflow: "hidden", display: "flex", alignItems: "center", justifyContent: "center", background: "#0a0b0d", flexShrink: 0 }}>
+                            {l.gifUrl ? (
+                              <img src={l.gifUrl} alt={l.name} style={{ width: "100%", height: "100%", objectFit: "cover" }} />
+                            ) : (
+                              <PlateIcon size={16} color="var(--chalk-dim)" />
+                            )}
+                          </div>
+                          <div style={{ flex: 1, minWidth: 0 }}>
+                            <div style={{ fontWeight: 700, fontSize: "15px", fontFamily: "Oswald, sans-serif", color: "#ffffff" }}>
+                              {l.name}
+                            </div>
+                            <div style={{ fontSize: "11px", color: "var(--chalk-dim)" }}>
+                              {(l.sets || []).length} {(l.sets || []).length === 1 ? "set" : "sets"}
+                            </div>
+                          </div>
+                        </div>
+
+                        {/* Sets list in clean read-only format */}
+                        <div style={{ paddingLeft: "54px", display: "flex", flexDirection: "column", gap: "6px" }}>
+                          {(l.sets || []).map((s) => (
+                            <div key={s.id} style={{ display: "flex", alignItems: "center", gap: "10px", fontSize: "13px" }}>
+                              <span
+                                className="set-type-badge-btn"
+                                style={{
+                                  color: getSetTypeColor(s.type),
+                                  cursor: "default",
+                                  pointerEvents: "none",
+                                  width: "36px",
+                                  height: "26px",
+                                  fontSize: "12px",
+                                }}
+                              >
+                                {s.type}
+                              </span>
+                              <span style={{ fontWeight: 600, color: "var(--chalk)" }}>
+                                {s.weight || 0} {l.unit || "kg"}
+                              </span>
+                              <span style={{ color: "var(--chalk-dim)", fontSize: "12px" }}>×</span>
+                              <span style={{ fontWeight: 600, color: "var(--chalk)" }}>
+                                {s.reps || 0} reps
+                              </span>
+                              {s.equipment === 'gear' ? (
+                                <span className="read-gear-badge">Gear</span>
+                              ) : (
+                                <span className="read-raw-badge">Raw</span>
+                              )}
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    ))
+                  )}
+                </div>
+
+                {notes && (
+                  <div style={{ padding: "10px 14px", background: "var(--bg-card)", borderRadius: "8px", border: "1px solid var(--border)" }}>
+                    <div style={{ fontSize: "11px", color: "var(--chalk-dim)", textTransform: "uppercase", marginBottom: "4px" }}>
+                      Notes
+                    </div>
+                    <div style={{ fontSize: "13px", color: "var(--chalk)", whiteSpace: "pre-wrap" }}>
+                      {notes}
+                    </div>
+                  </div>
+                )}
+              </div>
+            ) : (
+              /* Editable Form */
+              <>
+                <div className="field-row">
+                  <label className="field-label">Type</label>
+                  <div className="type-pills">
+                    {Object.entries(DAY_TYPES)
+                      .filter(([k]) => k !== "empty")
+                      .map(([k, v]) => (
+                        <button
+                          key={k}
+                          className={`pill ${type === k ? "pill-active" : ""}`}
+                          onClick={() => setType(k)}
+                          style={{
+                            display: "inline-flex",
+                            alignItems: "center",
+                            gap: "5px",
+                            ...(type === k && v.iconType === "workout" ? { borderColor: "#10b981", color: "#34d399", background: "rgba(16, 185, 129, 0.2)" } : {}),
+                            ...(type === k && v.iconType === "recovery" ? { borderColor: "#38bdf8", color: "#38bdf8", background: "rgba(56, 189, 248, 0.2)" } : {}),
+                            ...(type === k && v.iconType === "alert" ? { borderColor: "#ef4444", color: "#f87171", background: "rgba(239, 68, 68, 0.2)" } : {}),
+                          }}
+                        >
+                          {v.iconType === "recovery" && <BatteryCharging size={12} className="text-sky-400" style={{ color: "#38bdf8" }} />}
+                          {v.iconType === "alert" && <AlertCircle size={12} className="text-rose-400" style={{ color: "#ef4444" }} />}
+                          <span>{v.label}</span>
+                        </button>
+                      ))}
+                  </div>
+                </div>
+
+                {/* Compact Live Workout Stats Bar */}
+                {type === "workout" && (
+                  <div className="workout-live-stats-bar">
+                    {/* Live Timer */}
+                    <div className="workout-live-stat-card">
+                      <div className="workout-stat-header">
+                        <Timer size={11} className="text-emerald-400 flex-shrink-0" />
+                        <span className="workout-stat-label">Time</span>
+                      </div>
+                      <div className="workout-stat-value text-emerald-400">
+                        {formatTimer(elapsedSeconds)}
+                      </div>
+                    </div>
+
+                    {/* Volume */}
+                    <div className="workout-live-stat-card">
+                      <div className="workout-stat-header">
+                        <Dumbbell size={11} className="text-sky-400 flex-shrink-0" />
+                        <span className="workout-stat-label">Volume</span>
+                      </div>
+                      <div className="workout-stat-value text-sky-400">
+                        {totalVolume.toLocaleString()}<span className="workout-stat-unit">kg</span>
+                      </div>
+                    </div>
+
+                    {/* Sets */}
+                    <div className="workout-live-stat-card">
+                      <div className="workout-stat-header">
+                        <Layers size={11} className="text-amber-400 flex-shrink-0" />
+                        <span className="workout-stat-label">Sets</span>
+                      </div>
+                      <div className="workout-stat-value text-amber-400">
+                        {totalSets}<span className="workout-stat-unit">sets</span>
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+                <div className="field-row">
+                  <label className="field-label" htmlFor="title-input">Title</label>
+                  <input
+                    id="title-input"
+                    className="text-input"
+                    placeholder={type === "workout" ? "e.g. Bench press + tricep" : "e.g. Feeling drained"}
+                    value={title}
+                    onChange={(e) => setTitle(e.target.value)}
+                  />
+                </div>
+
+                {type === "workout" && (
+                  <>
+                    <div className="field-row">
+                      <label className="field-label">Body focus</label>
+                      <div className="type-pills">
+                        {BODY_TAGS.map((tag) => (
+                          <button
+                            key={tag}
+                            className={`pill pill-sm ${bodyTags.includes(tag) ? "pill-active" : ""}`}
+                            onClick={() => toggleTag(tag)}
+                          >
+                            {tag}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+
+                    <div className="field-row">
+                      <label className="field-label">Lifts</label>
+                      <div className="lift-table" style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
+                        {lifts.map((l) => (
+                          <LiftRowItem
+                            key={l.id}
+                            l={l}
+                            updateLift={updateLift}
+                            removeLift={removeLift}
+                            onOpenSetTypeModal={(liftId, setId) => {
+                              setActiveSetTypeModalInfo({ liftId, setId });
+                              setActiveInfo(null);
+                            }}
+                          />
+                        ))}
+
+                        <button className="add-lift-btn" type="button" onClick={handleAddLiftClick}>+ Add lift</button>
+                      </div>
+                    </div>
+                  </>
+                )}
+
+                <div className="field-row">
+                  <label className="field-label" htmlFor="notes-input">Notes</label>
+                  <textarea
+                    id="notes-input"
+                    className="text-input textarea"
+                    rows={3}
+                    value={notes}
+                    onChange={(e) => setNotes(e.target.value)}
+                  />
+                </div>
+              </>
+            )}
+          </div>
+
+          <div className="modal-footer">
+            {!isEditMode ? (
+              <>
+                <button
+                  className="btn-ghost"
+                  onClick={() => setIsEditMode(true)}
+                  style={{ display: "flex", alignItems: "center", gap: "6px" }}
+                >
+                  <Pencil size={13} />
+                  <span>Edit Workout</span>
+                </button>
+                <div className="spacer" />
+                <button className="btn-primary" onClick={onClose}>Done</button>
+              </>
+            ) : (
+              <>
+                {day.type !== "empty" && (
+                  <button className="btn-ghost" onClick={() => onDelete(day.id)}>Clear day</button>
+                )}
+                <div className="spacer" />
+                <button
+                  className="btn-ghost"
+                  onClick={handleCancelClick}
+                >
+                  Cancel
+                </button>
+                <button
+                  className="btn-primary"
+                  onClick={() => {
+                    handleSave();
+                    setIsEditMode(false);
+                  }}
+                >
+                  Save entry
+                </button>
+              </>
+            )}
+          </div>
+        </div>
+      </div>
+
+      {/* Common Set Type Bottom Sheet Modal across all exercises */}
+      {(() => {
+        if (!activeSetTypeModalInfo) return null;
+        const targetLift = lifts.find((l) => l.id === activeSetTypeModalInfo.liftId);
+        if (!targetLift) return null;
+        const sets: SetEntry[] = Array.isArray(targetLift.sets) ? targetLift.sets : [];
+        const targetSet = sets.find((s) => s.id === activeSetTypeModalInfo.setId);
+        if (!targetSet) return null;
+        const targetIndex = sets.findIndex((s) => s.id === activeSetTypeModalInfo.setId);
+        const normalSetNumber = targetIndex >= 0
+          ? String(sets.slice(0, targetIndex + 1).filter((s) => s.id === targetSet.id || !isNaN(Number(s.type))).length || 1)
+          : "1";
+        const isNormalSelected = !isNaN(Number(targetSet.type));
+
+        const handleSelectType = (code: string) => {
+          const newType = code === "NORMAL" ? normalSetNumber : code;
+          const updatedSets = sets.map((s) => (s.id === targetSet.id ? { ...s, type: newType } : s));
+          updateLift(targetLift.id, { sets: updatedSets });
+          setActiveSetTypeModalInfo(null);
+          setActiveInfo(null);
+        };
+
+        const handleRemoveSet = () => {
+          const updatedSets = sets.filter((s) => s.id !== targetSet.id);
+          updateLift(targetLift.id, { sets: updatedSets });
+          setActiveSetTypeModalInfo(null);
+          setActiveInfo(null);
+        };
+
+        return (
+          <div
+            className="set-type-modal-backdrop"
+            onClick={() => {
+              setActiveSetTypeModalInfo(null);
+              setActiveInfo(null);
+            }}
+          >
+            <div
+              className="set-type-bottom-sheet"
+              onClick={(e) => e.stopPropagation()}
+            >
+              {/* Drag handle */}
+              <div className="set-type-drag-handle" />
+
+              {/* Title Header with Exercise Name */}
+              <div style={{ textAlign: "center", marginBottom: "14px" }}>
+                <div style={{ fontSize: "12px", color: "var(--chalk-dim, #94a3b8)", textTransform: "uppercase", letterSpacing: "0.5px", marginBottom: "2px" }}>
+                  {targetLift.name || "Exercise"} • Set {normalSetNumber}
+                </div>
+                <div className="set-type-sheet-title" style={{ margin: 0 }}>
+                  Select set type
                 </div>
               </div>
-              <div className="timeline-list">
-                {group.map((m) => {
-                  const phase = PHASES[m.phaseKey];
-                  const active = m.id === selectedId;
+
+              {/* Info hint banner if ? clicked */}
+              {activeInfo && (
+                <div className="set-type-info-banner">
+                  <span>{activeInfo}</span>
+                  <button
+                    type="button"
+                    onClick={() => setActiveInfo(null)}
+                    className="set-type-info-close"
+                  >
+                    ✕
+                  </button>
+                </div>
+              )}
+
+              {/* Normal Working Set option */}
+              <button
+                type="button"
+                className={`set-type-grid-card ${isNormalSelected ? "is-selected" : ""}`}
+                onClick={() => handleSelectType("NORMAL")}
+                style={{ marginBottom: "8px", width: "100%" }}
+              >
+                <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+                  <span style={{ color: "#edeae2", fontWeight: 800, fontSize: "15px", width: "28px", textAlign: "left" }}>
+                    {normalSetNumber}
+                  </span>
+                  <span style={{ color: "#ffffff", fontWeight: 600, fontSize: "14px" }}>
+                    Normal Set
+                  </span>
+                </div>
+                <span
+                  className="set-type-help-btn"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setActiveInfo("Normal Set: Standard working set counted towards training volume.");
+                  }}
+                  title="View info"
+                >
+                  ?
+                </span>
+              </button>
+
+              {/* 2-Column Grid (Row-by-Row matching user screenshot) */}
+              <div className="set-type-options-grid">
+                {SET_TYPE_ITEMS.map((item) => {
+                  const isSelected = targetSet.type === item.code;
                   return (
                     <button
-                      key={m.id}
-                      className={`timeline-item ${active ? "timeline-item-active" : ""}`}
-                      style={{ "--phase": phase.color } as React.CSSProperties}
-                      onClick={() => {
-                        onSelect(m.id);
-                        setIsOpen(false);
-                      }}
+                      key={item.code}
+                      type="button"
+                      className={`set-type-grid-card ${isSelected ? "is-selected" : ""}`}
+                      onClick={() => handleSelectType(item.code)}
                     >
-                      <span className="timeline-dot" />
-                      <span className="timeline-item-body">
-                        <span className="timeline-index">MS{m.index}</span>
-                        <span className="timeline-name">{m.name}</span>
-                        <span className="timeline-range">{fmtDateShort(m.start)} – {fmtDateShort(m.end)}</span>
+                      <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+                        <span style={{ color: item.color, fontWeight: 800, fontSize: "15px", width: "28px", textAlign: "left" }}>
+                          {item.code}
+                        </span>
+                        <span style={{ color: "#ffffff", fontWeight: 600, fontSize: "14px" }}>
+                          {item.label}
+                        </span>
+                      </div>
+                      <span
+                        className="set-type-help-btn"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setActiveInfo(`${item.label}: ${item.desc}`);
+                        }}
+                        title="View info"
+                      >
+                        ?
                       </span>
-                      {m.status === "active" && <span className="live-dot" aria-label="Active" />}
                     </button>
                   );
                 })}
-                {group.length === 0 && <div className="macro-empty-hint">No mesocycles yet</div>}
+
+                {/* Remove Set Button (Matching screenshot bottom-right) */}
+                <button
+                  type="button"
+                  className="set-type-grid-card set-type-remove-card"
+                  onClick={handleRemoveSet}
+                >
+                  <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+                    <Trash2 size={16} className="text-rose-400" />
+                    <span style={{ color: "#f87171", fontWeight: 600, fontSize: "14px" }}>
+                      Remove set
+                    </span>
+                  </div>
+                </button>
               </div>
-              <button className="add-meso-inline-btn" onClick={() => onAddMeso(macro.id)}>
-                + Add mesocycle to {macro.name}
+            </div>
+          </div>
+        );
+      })()}
+
+      {/* Workout Options Bottom Action Sheet for DayModal */}
+      {isMenuOpen && (
+        <div
+          className="workout-sheet-backdrop"
+          onClick={() => setIsMenuOpen(false)}
+        >
+          <div
+            className="workout-sheet-container"
+            onClick={(e) => e.stopPropagation()}
+          >
+            {/* Drag handle */}
+            <div className="workout-sheet-drag-handle" />
+
+            {/* Header info */}
+            <div className="workout-sheet-header">
+              <div className="workout-sheet-title">
+                {day.title || "Workout Session"}
+              </div>
+              <div className="workout-sheet-date">
+                {fmtDateFull(day.date)} • {lifts.length} exercises
+              </div>
+            </div>
+
+            {/* Menu options list */}
+            <div className="workout-sheet-options">
+              {/* 1. Edit */}
+              <button
+                type="button"
+                className="workout-sheet-btn"
+                onClick={() => {
+                  setIsEditMode(true);
+                  setIsMenuOpen(false);
+                }}
+              >
+                <div className="workout-sheet-btn-icon" style={{ background: "rgba(56, 189, 248, 0.15)", color: "#38bdf8" }}>
+                  <Pencil size={18} />
+                </div>
+                <div className="workout-sheet-btn-text">
+                  <div className="workout-sheet-btn-title">Edit Workout</div>
+                  <div className="workout-sheet-btn-sub">Modify exercises, sets, weights, and reps</div>
+                </div>
+              </button>
+
+              {/* 2. Perform Again */}
+              <button
+                type="button"
+                className="workout-sheet-btn"
+                onClick={() => {
+                  setIsMenuOpen(false);
+                  handlePerformAgain();
+                }}
+              >
+                <div className="workout-sheet-btn-icon" style={{ background: "rgba(16, 185, 129, 0.15)", color: "#34d399" }}>
+                  <RotateCcw size={18} />
+                </div>
+                <div className="workout-sheet-btn-text">
+                  <div className="workout-sheet-btn-title">Perform Again</div>
+                  <div className="workout-sheet-btn-sub">Start a live workout with these exercises</div>
+                </div>
+              </button>
+
+              {/* 3. Share */}
+              <button
+                type="button"
+                className="workout-sheet-btn"
+                onClick={() => {
+                  setIsMenuOpen(false);
+                  handleShare();
+                }}
+              >
+                <div className="workout-sheet-btn-icon" style={{ background: "rgba(99, 102, 241, 0.15)", color: "#818cf8" }}>
+                  <Share2 size={18} />
+                </div>
+                <div className="workout-sheet-btn-text">
+                  <div className="workout-sheet-btn-title">Share Workout</div>
+                  <div className="workout-sheet-btn-sub">Copy formatted summary to clipboard</div>
+                </div>
+              </button>
+
+              {/* 4. Favorites */}
+              <button
+                type="button"
+                className="workout-sheet-btn"
+                onClick={() => {
+                  toggleFavorite();
+                  setIsMenuOpen(false);
+                }}
+              >
+                <div className="workout-sheet-btn-icon" style={{ background: "rgba(245, 158, 11, 0.15)", color: "#fbbf24" }}>
+                  <Star size={18} className={isFavorite ? "fill-amber-400" : ""} />
+                </div>
+                <div className="workout-sheet-btn-text">
+                  <div className="workout-sheet-btn-title">
+                    {isFavorite ? "Remove from Favorites" : "Add to Favorites"}
+                  </div>
+                  <div className="workout-sheet-btn-sub">Bookmark this routine for quick access</div>
+                </div>
+              </button>
+
+              {/* Divider */}
+              <div style={{ height: "1px", background: "#252d3d", margin: "6px 0" }} />
+
+              {/* 5. Delete */}
+              <button
+                type="button"
+                className="workout-sheet-btn workout-sheet-btn-danger"
+                onClick={() => {
+                  setIsMenuOpen(false);
+                  if (window.confirm("Are you sure you want to delete this workout session?")) {
+                    onDelete(day.id);
+                  }
+                }}
+              >
+                <div className="workout-sheet-btn-icon" style={{ background: "rgba(239, 68, 68, 0.15)", color: "#f87171" }}>
+                  <Trash2 size={18} />
+                </div>
+                <div className="workout-sheet-btn-text">
+                  <div className="workout-sheet-btn-title" style={{ color: "#f87171" }}>Delete Workout</div>
+                  <div className="workout-sheet-btn-sub">Permanently remove this session log</div>
+                </div>
               </button>
             </div>
-          );
-        })}
-        <button className="add-macro-btn" onClick={onAddMacro}>+ Add macrocycle</button>
-      </div>
-    </div>
+
+            {/* Cancel Button */}
+            <button
+              type="button"
+              className="workout-sheet-cancel-btn"
+              onClick={() => setIsMenuOpen(false)}
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Discard Workout Confirmation Modal */}
+      {showDiscardConfirm && (
+        <div
+          className="modal-backdrop"
+          style={{ zIndex: 1200 }}
+          onClick={() => setShowDiscardConfirm(false)}
+        >
+          <div
+            className="modal modal-narrow"
+            onClick={(e) => e.stopPropagation()}
+            style={{
+              background: "#111622",
+              border: "1px solid rgba(239, 68, 68, 0.35)",
+              boxShadow: "0 12px 36px rgba(0, 0, 0, 0.75)",
+              maxWidth: "380px",
+              padding: "0",
+              overflow: "hidden",
+            }}
+          >
+            <div
+              className="modal-header"
+              style={{
+                borderBottom: "1px solid rgba(255, 255, 255, 0.08)",
+                padding: "14px 18px",
+              }}
+            >
+              <div
+                className="modal-date"
+                style={{
+                  color: "#ffffff",
+                  fontSize: "15px",
+                  display: "flex",
+                  alignItems: "center",
+                  gap: "8px",
+                }}
+              >
+                <AlertCircle size={17} className="text-rose-400" style={{ color: "#ef4444" }} />
+                <span>Discard Workout?</span>
+              </div>
+              <button
+                className="icon-btn"
+                onClick={() => setShowDiscardConfirm(false)}
+                aria-label="Close"
+              >
+                ✕
+              </button>
+            </div>
+
+            <div className="modal-body" style={{ gap: "10px", padding: "18px" }}>
+              <p style={{ fontSize: "14px", color: "#e2e8f0", margin: 0, fontWeight: 500, lineHeight: 1.5 }}>
+                Would you like to discard the workout?
+              </p>
+              <p style={{ fontSize: "12px", color: "#94a3b8", margin: 0, lineHeight: 1.4 }}>
+                Any unsaved changes and logged sets in this session will be lost.
+              </p>
+            </div>
+
+            <div
+              className="modal-footer"
+              style={{
+                padding: "12px 18px 16px",
+                display: "flex",
+                gap: "10px",
+                justifyContent: "flex-end",
+                borderTop: "1px solid rgba(255, 255, 255, 0.06)",
+              }}
+            >
+              <button
+                type="button"
+                className="btn-ghost"
+                style={{
+                  padding: "8px 16px",
+                  fontSize: "12.5px",
+                  color: "#e2e8f0",
+                }}
+                onClick={() => setShowDiscardConfirm(false)}
+              >
+                No, Continue
+              </button>
+              <button
+                type="button"
+                style={{
+                  background: "linear-gradient(135deg, #ef4444, #dc2626)",
+                  color: "#ffffff",
+                  border: "none",
+                  borderRadius: "7px",
+                  padding: "8px 16px",
+                  fontSize: "12.5px",
+                  fontWeight: 600,
+                  cursor: "pointer",
+                  boxShadow: "0 2px 8px rgba(239, 68, 68, 0.35)",
+                }}
+                onClick={handleConfirmDiscard}
+              >
+                Yes, Discard
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </>
   );
 }
 
@@ -1495,11 +2099,12 @@ export default function IronLedger() {
     loaded, saveState,
   } = useLedgerStore();
   const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [activeDay, setActiveDay] = useState<{ mesoId: string; micId: string; day: DayEntry } | null>(null);
+  const [activeDay, setActiveDay] = useState<{ mesoId: string; micId: string; day: DayEntry; initialEditMode?: boolean; isLive?: boolean; originalDay?: DayEntry } | null>(null);
+  const [liveWorkout, setLiveWorkout] = useState<{ mesoId: string; micId: string; day: DayEntry; initialEditMode?: boolean; originalDay?: DayEntry } | null>(null);
   const [addingMeso, setAddingMeso] = useState(false);
   const [addingMesoMacroId, setAddingMesoMacroId] = useState<string | null>(null);
   const [addingMacro, setAddingMacro] = useState(false);
-  const [activeTab, setActiveTab] = useState<TabType>('library');
+  const [activeTab, setActiveTab] = useState<TabType>('home');
   const [workoutEntries, setWorkoutEntries] = useState<WorkoutEntry[]>(INITIAL_WORKOUT_DATA);
   const [isDayModalMinimized, setIsDayModalMinimized] = useState(false);
   const [showResumeDiscardPrompt, setShowResumeDiscardPrompt] = useState(false);
@@ -1514,13 +2119,72 @@ export default function IronLedger() {
 
   const selectedMeso = mesocycles.find((m) => m.id === selectedId) || null;
 
-  const openDay = (mesoId: string, micId: string, day: DayEntry) => {
-    setActiveDay({ mesoId, micId, day });
+  const openDay = (mesoId: string, micId: string, day: DayEntry, initialEditMode = false) => {
+    setActiveDay({
+      mesoId,
+      micId,
+      day,
+      initialEditMode,
+      isLive: false,
+      originalDay: JSON.parse(JSON.stringify(day)),
+    });
+    setLiveWorkout(null);
+    setIsDayModalMinimized(false);
+  };
+
+  const handlePerformAgain = (sourceDay: DayEntry) => {
+    const meso = selectedMeso || mesocycles.find((m) => m.status === "active") || mesocycles[0];
+    if (!meso) return;
+
+    const clonedLifts: LiftEntry[] = (sourceDay.lifts || []).map((l) => ({
+      ...l,
+      id: uid(),
+      sets: (l.sets || []).map((s) => ({
+        ...s,
+        id: uid(),
+        isPR: false,
+      })),
+    }));
+
+    let targetMicId = meso.microcycles[0]?.id || "";
+    let targetDay = meso.microcycles[0]?.days[0];
+    for (const mc of meso.microcycles) {
+      const found = mc.days.find((d) => d.date === today);
+      if (found) {
+        targetMicId = mc.id;
+        targetDay = found;
+        break;
+      }
+    }
+
+    if (!targetDay || !targetMicId) return;
+
+    const originalSnapshot: DayEntry = JSON.parse(JSON.stringify(targetDay));
+
+    const newDay: DayEntry = {
+      ...targetDay,
+      type: "workout",
+      title: sourceDay.title ? `${sourceDay.title} (Repeat)` : "Workout Session",
+      bodyTags: [...(sourceDay.bodyTags || [])],
+      lifts: clonedLifts,
+      notes: sourceDay.notes || "",
+    };
+
+    updateDayDraft(newDay);
+    const liveSession = {
+      mesoId: meso.id,
+      micId: targetMicId,
+      day: newDay,
+      initialEditMode: true,
+      originalDay: originalSnapshot,
+    };
+    setLiveWorkout(liveSession);
+    setActiveDay({ ...liveSession, isLive: true });
     setIsDayModalMinimized(false);
   };
 
   const handleStartWorkoutClick = () => {
-    if (activeDay !== null) {
+    if (liveWorkout !== null) {
       setShowResumeDiscardPrompt(true);
     } else {
       handleStartNewWorkout();
@@ -1535,7 +2199,11 @@ export default function IronLedger() {
     for (const mc of meso.microcycles) {
       const todayDay = mc.days.find((d: DayEntry) => d.date === today);
       if (todayDay) {
-        setActiveDay({ mesoId: meso.id, micId: mc.id, day: todayDay });
+        const originalSnapshot: DayEntry = JSON.parse(JSON.stringify(todayDay));
+        const liveSession = { mesoId: meso.id, micId: mc.id, day: todayDay, initialEditMode: true, originalDay: originalSnapshot };
+        setLiveWorkout(liveSession);
+        setActiveDay({ ...liveSession, isLive: true });
+        setIsDayModalMinimized(false);
         return;
       }
     }
@@ -1543,20 +2211,92 @@ export default function IronLedger() {
     // Fallback: pick the first day of the active microcycle
     if (meso.microcycles.length > 0 && meso.microcycles[0].days.length > 0) {
       const mc = meso.microcycles[0];
-      setActiveDay({ mesoId: meso.id, micId: mc.id, day: mc.days[0] });
+      const originalSnapshot: DayEntry = JSON.parse(JSON.stringify(mc.days[0]));
+      const liveSession = { mesoId: meso.id, micId: mc.id, day: mc.days[0], initialEditMode: true, originalDay: originalSnapshot };
+      setLiveWorkout(liveSession);
+      setActiveDay({ ...liveSession, isLive: true });
       setIsDayModalMinimized(false);
     }
   };
 
+  const handleDiscardWorkout = () => {
+    if (!activeDay) return;
+    const { mesoId, micId, day, originalDay } = activeDay;
+
+    // Check if it was originally an empty day or unlogged session
+    const wasEmpty =
+      !originalDay ||
+      originalDay.type === "empty" ||
+      (!originalDay.title && (!originalDay.lifts || originalDay.lifts.length === 0));
+
+    if (wasEmpty) {
+      // Revert completely back to an empty day in mesocycles
+      setMesocycles((prev) =>
+        prev.map((m) =>
+          m.id !== mesoId
+            ? m
+            : {
+                ...m,
+                microcycles: m.microcycles.map((mc) =>
+                  mc.id !== micId
+                    ? mc
+                    : {
+                        ...mc,
+                        days: mc.days.map((d) =>
+                          d.id === day.id
+                            ? {
+                                id: d.id,
+                                date: d.date,
+                                type: "empty",
+                                title: "",
+                                bodyTags: [],
+                                lifts: [],
+                                notes: "",
+                                durationSeconds: 0,
+                              }
+                            : d
+                        ),
+                      }
+                ),
+              }
+        )
+      );
+    } else {
+      // Restore original day snapshot exactly as it was before editing
+      setMesocycles((prev) =>
+        prev.map((m) =>
+          m.id !== mesoId
+            ? m
+            : {
+                ...m,
+                microcycles: m.microcycles.map((mc) =>
+                  mc.id !== micId
+                    ? mc
+                    : {
+                        ...mc,
+                        days: mc.days.map((d) => (d.id === day.id ? originalDay : d)),
+                      }
+                ),
+              }
+        )
+      );
+    }
+
+    setActiveDay(null);
+    setLiveWorkout(null);
+    setIsDayModalMinimized(false);
+  };
+
   const saveDay = (updatedDay: DayEntry) => {
+    if (!activeDay) return;
     setMesocycles((prev) =>
       prev.map((m) =>
-        m.id !== activeDay!.mesoId
+        m.id !== activeDay.mesoId
           ? m
           : {
               ...m,
               microcycles: m.microcycles.map((mc) =>
-                mc.id !== activeDay!.micId
+                mc.id !== activeDay.micId
                   ? mc
                   : { ...mc, days: mc.days.map((d) => (d.id === updatedDay.id ? updatedDay : d)) }
               ),
@@ -1588,7 +2328,10 @@ export default function IronLedger() {
         return [...withoutSameDayLift, ...newPRs];
       });
     }
+
     setActiveDay(null);
+    setLiveWorkout(null);
+    setIsDayModalMinimized(false);
   };
 
   const updateDayDraft = (updatedDay: DayEntry) => {
@@ -1608,6 +2351,9 @@ export default function IronLedger() {
       )
     );
     setActiveDay({ ...activeDay, day: updatedDay });
+    if (activeDay.isLive) {
+      setLiveWorkout((prev) => (prev ? { ...prev, day: updatedDay } : null));
+    }
   };
 
   const handleAddExerciseToActiveDay = (name: string, gifUrl?: string) => {
@@ -1617,7 +2363,7 @@ export default function IronLedger() {
       if (meso && meso.microcycles.length > 0 && meso.microcycles[0].days.length > 0) {
         const mc = meso.microcycles[0];
         const day = mc.days[0];
-        currentActive = { mesoId: meso.id, micId: mc.id, day };
+        currentActive = { mesoId: meso.id, micId: mc.id, day, isLive: false };
       }
     }
     if (!currentActive) return;
@@ -1649,7 +2395,11 @@ export default function IronLedger() {
             }
       )
     );
-    setActiveDay({ ...currentActive, day: updatedDay });
+    setActiveDay({ ...currentActive, day: updatedDay, initialEditMode: true });
+    if (currentActive.isLive) {
+      setLiveWorkout({ mesoId: currentActive.mesoId, micId: currentActive.micId, day: updatedDay, initialEditMode: true });
+    }
+    setIsDayModalMinimized(false);
   };
 
   const handleAddExercisesToActiveDay = (exercisesList: { name: string; gifUrl?: string }[]) => {
@@ -1660,7 +2410,7 @@ export default function IronLedger() {
       if (meso && meso.microcycles.length > 0 && meso.microcycles[0].days.length > 0) {
         const mc = meso.microcycles[0];
         const day = mc.days[0];
-        currentActive = { mesoId: meso.id, micId: mc.id, day };
+        currentActive = { mesoId: meso.id, micId: mc.id, day, initialEditMode: true, isLive: false };
       }
     }
     if (!currentActive) return;
@@ -1693,33 +2443,29 @@ export default function IronLedger() {
             }
       )
     );
-    setActiveDay({ ...currentActive, day: updatedDay });
+    setActiveDay({ ...currentActive, day: updatedDay, initialEditMode: true });
+    if (currentActive.isLive) {
+      setLiveWorkout({ mesoId: currentActive.mesoId, micId: currentActive.micId, day: updatedDay, initialEditMode: true });
+    }
     setIsDayModalMinimized(false);
   };
 
   const clearDay = (dayId: string) => {
     setMesocycles((prev) =>
-      prev.map((m) =>
-        m.id !== activeDay!.mesoId
-          ? m
-          : {
-              ...m,
-              microcycles: m.microcycles.map((mc) =>
-                mc.id !== activeDay!.micId
-                  ? mc
-                  : {
-                      ...mc,
-                      days: mc.days.map((d) =>
-                        d.id === dayId
-                          ? { ...d, type: "empty", title: "", bodyTags: [], lifts: [], notes: "" }
-                          : d
-                      ),
-                    }
-              ),
-            }
-      )
+      prev.map((m) => ({
+        ...m,
+        microcycles: m.microcycles.map((mc) => ({
+          ...mc,
+          days: mc.days.map((d) =>
+            d.id === dayId
+              ? { ...d, type: "empty", title: "", bodyTags: [], lifts: [], notes: "" }
+              : d
+          ),
+        })),
+      }))
     );
-    setActiveDay(null);
+    if (activeDay?.day.id === dayId) setActiveDay(null);
+    if (liveWorkout?.day.id === dayId) setLiveWorkout(null);
   };
 
   const addMicrocycleTo = (mesoId: string, built: Microcycle) => {
@@ -1735,44 +2481,28 @@ export default function IronLedger() {
     name: string; phaseKey: string; start: string; weeks: number; micLen: number; macroId: string;
   }) => {
     const targetMacroId = macroId || macrocycles[macrocycles.length - 1]?.id;
-    const macroMesos = mesocycles.filter((m) => m.macroId === targetMacroId);
-    const lastIndex = macroMesos.length;
     const totalDays = weeks * micLen;
     const end = addDays(start, totalDays - 1);
     const micCount = weeks;
 
-    let lastMicIndex = 0;
-    macroMesos.forEach((m) => {
-      if (m.microcycles.length > 0) {
-        const highest = Math.max(...m.microcycles.map((mc) => mc.index));
-        if (highest > lastMicIndex) lastMicIndex = highest;
-      } else if (m.micRange) {
-        const parts = m.micRange.split(/[–-]/);
-        const endRange = parseInt(parts[1] || parts[0], 10);
-        if (!isNaN(endRange) && endRange > lastMicIndex) lastMicIndex = endRange;
-      }
-    });
-
-    const startMicIndex = lastMicIndex + 1;
-    const endMicIndex = lastMicIndex + micCount;
     const ranges = Array.from({ length: micCount }, (_, i) => ({
-      index: startMicIndex + i,
+      index: i + 1,
       length: micLen,
     }));
     const microcycles = buildMicrocycles(start, ranges);
     const newMeso: Mesocycle = {
       id: uid(),
       macroId: targetMacroId,
-      index: lastIndex + 1,
+      index: 1,
       name,
       phaseKey,
-      micRange: `${startMicIndex}–${endMicIndex}`,
+      micRange: `1–${micCount}`,
       start,
       end,
       status: today < start ? "upcoming" : today > end ? "completed" : "active",
       microcycles,
     };
-    setMesocycles((prev) => [...prev, newMeso]);
+    setMesocycles((prev) => healAllMesocycles([...prev, newMeso], macrocycles));
     setSelectedId(newMeso.id);
     setAddingMeso(false);
     setAddingMesoMacroId(null);
@@ -1901,15 +2631,15 @@ export default function IronLedger() {
     }
   };
 
-  const sessionsLogged = mesocycles.reduce(
-    (acc, m) =>
-      acc +
-      m.microcycles.reduce(
-        (a2, mc) => a2 + mc.days.filter((d) => d.type !== "empty").length,
-        0
-      ),
-    0
-  );
+  const setActiveMesocycleStatus = (mesoId: string) => {
+    setMesocycles((prev) =>
+      prev.map((m) => ({
+        ...m,
+        status: m.id === mesoId ? "active" : m.status === "active" ? "completed" : m.status,
+      }))
+    );
+    setSelectedId(mesoId);
+  };
 
   return (
     <div className="iron-ledger">
@@ -1950,6 +2680,58 @@ export default function IronLedger() {
         .save-idle, .save-saved { background: var(--sage); }
         .save-saving { background: var(--brass); }
         .save-error { background: var(--iron-red); }
+
+        .workout-live-stats-bar {
+          display: grid;
+          grid-template-columns: repeat(3, 1fr);
+          gap: 6px;
+          background: rgba(15, 23, 42, 0.6);
+          border: 1px solid rgba(56, 189, 248, 0.15);
+          border-radius: 9px;
+          padding: 6px 8px;
+          margin: 4px 0 10px 0;
+          box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25);
+        }
+        .workout-live-stat-card {
+          background: rgba(255, 255, 255, 0.03);
+          border: 1px solid rgba(255, 255, 255, 0.06);
+          border-radius: 7px;
+          padding: 5px 8px;
+          display: flex;
+          flex-direction: column;
+          justify-content: center;
+          min-width: 0;
+        }
+        .workout-stat-header {
+          display: flex;
+          align-items: center;
+          gap: 4px;
+        }
+        .workout-stat-label {
+          font-size: 9px;
+          font-weight: 700;
+          letter-spacing: 0.5px;
+          text-transform: uppercase;
+          color: #94a3b8;
+          line-height: 1;
+        }
+        .workout-stat-value {
+          font-family: 'Oswald', sans-serif;
+          font-size: 15px;
+          font-weight: 700;
+          line-height: 1.15;
+          margin-top: 3px;
+          font-variant-numeric: tabular-nums;
+          white-space: nowrap;
+          overflow: hidden;
+          text-overflow: ellipsis;
+        }
+        .workout-stat-unit {
+          font-size: 10px;
+          font-weight: 500;
+          color: #94a3b8;
+          margin-left: 2px;
+        }
 
         .pr-shelf { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-bottom: 28px; }
         .pr-card { background: var(--bg-card); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; }
@@ -2100,6 +2882,367 @@ export default function IronLedger() {
           display: flex;
           flex-direction: column;
           gap: 6px;
+        }
+
+        .set-equip-toggle {
+          display: inline-flex;
+          align-items: center;
+          background: #0d121c;
+          border: 1px solid #232c3f;
+          border-radius: 7px;
+          padding: 2px;
+          gap: 2px;
+          margin-left: auto;
+          flex-shrink: 0;
+        }
+
+        .set-equip-btn {
+          font-family: 'Inter', sans-serif;
+          font-size: 10px;
+          font-weight: 700;
+          padding: 3px 7px;
+          border-radius: 5px;
+          border: 1px solid transparent;
+          background: transparent;
+          color: #64748b;
+          cursor: pointer;
+          transition: all 0.15s ease;
+          user-select: none;
+          line-height: 1.2;
+        }
+
+        .set-equip-btn:hover {
+          color: #cbd5e1;
+        }
+
+        .set-equip-btn.is-raw {
+          background: #1e293b;
+          color: #38bdf8;
+          border-color: rgba(56, 189, 248, 0.3);
+          box-shadow: 0 1px 4px rgba(0, 0, 0, 0.3);
+        }
+
+        .set-equip-btn.is-gear {
+          background: linear-gradient(135deg, #f59e0b 0%, #d97706 100%);
+          color: #ffffff;
+          font-weight: 800;
+          border-color: #fbbf24;
+          box-shadow: 0 1px 6px rgba(245, 158, 11, 0.4);
+        }
+
+        .read-gear-badge {
+          font-size: 9.5px;
+          font-weight: 800;
+          color: #ffffff;
+          background: linear-gradient(135deg, #f59e0b 0%, #d97706 100%);
+          border: 1px solid #fbbf24;
+          padding: 2px 7px;
+          border-radius: 5px;
+          text-transform: uppercase;
+          letter-spacing: 0.5px;
+          margin-left: auto;
+          box-shadow: 0 1px 6px rgba(245, 158, 11, 0.4);
+          display: inline-flex;
+          align-items: center;
+        }
+
+        .read-raw-badge {
+          font-size: 9.5px;
+          font-weight: 800;
+          color: #38bdf8;
+          background: #1e293b;
+          border: 1px solid rgba(56, 189, 248, 0.35);
+          padding: 2px 7px;
+          border-radius: 5px;
+          text-transform: uppercase;
+          letter-spacing: 0.5px;
+          margin-left: auto;
+          box-shadow: 0 1px 4px rgba(0, 0, 0, 0.3);
+          display: inline-flex;
+          align-items: center;
+        }
+
+        .set-type-badge-btn {
+          width: 40px;
+          height: 28px;
+          padding: 0;
+          font-size: 13px;
+          font-weight: 800;
+          font-family: 'Inter', sans-serif;
+          background: var(--bg-card, #1a1f2c);
+          border: 1px solid var(--border, #293245);
+          border-radius: 8px;
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          cursor: pointer;
+          transition: all 0.15s ease;
+          user-select: none;
+        }
+        .set-type-badge-btn:hover {
+          border-color: #ffffff;
+          transform: scale(1.05);
+        }
+
+        .set-type-modal-backdrop {
+          position: fixed;
+          inset: 0;
+          background: rgba(0, 0, 0, 0.75);
+          backdrop-filter: blur(4px);
+          z-index: 12000;
+          display: flex;
+          align-items: flex-end;
+          justify-content: center;
+          padding: 0;
+        }
+
+        .set-type-bottom-sheet {
+          background: #131722;
+          border: 1px solid #283248;
+          border-bottom: none;
+          border-radius: 24px 24px 0 0;
+          width: 100%;
+          max-width: 480px;
+          padding: 16px 20px 28px;
+          box-shadow: 0 -10px 40px rgba(0, 0, 0, 0.85);
+          animation: slideUpSheet 0.24s cubic-bezier(0.16, 1, 0.3, 1);
+          max-height: 85vh;
+          overflow-y: auto;
+        }
+
+        @keyframes slideUpSheet {
+          from {
+            transform: translateY(100%);
+            opacity: 0;
+          }
+          to {
+            transform: translateY(0);
+            opacity: 1;
+          }
+        }
+
+        .set-type-drag-handle {
+          width: 38px;
+          height: 4px;
+          background: #374151;
+          border-radius: 2px;
+          margin: 0 auto 14px;
+        }
+
+        .set-type-sheet-title {
+          text-align: center;
+          font-size: 16px;
+          font-weight: 700;
+          color: #ffffff;
+          margin-bottom: 14px;
+        }
+
+        .set-type-options-grid {
+          display: grid;
+          grid-template-columns: repeat(2, 1fr);
+          gap: 8px;
+        }
+
+        .set-type-grid-card {
+          background: #181d29;
+          border: 1.5px solid #263043;
+          border-radius: 12px;
+          height: 48px;
+          padding: 0 12px;
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          cursor: pointer;
+          transition: all 0.15s ease;
+          user-select: none;
+        }
+        .set-type-grid-card:hover {
+          background: #202738;
+          border-color: #3e4d6a;
+        }
+        .set-type-grid-card.is-selected {
+          border: 2px solid #ffffff;
+          background: #1d2433;
+          box-shadow: 0 0 12px rgba(255, 255, 255, 0.2);
+        }
+
+        .set-type-remove-card:hover {
+          background: rgba(239, 68, 68, 0.15);
+          border-color: rgba(239, 68, 68, 0.4);
+        }
+
+        .set-type-help-btn {
+          color: #64748b;
+          font-size: 13px;
+          font-weight: 700;
+          padding: 4px 6px;
+          border-radius: 4px;
+          transition: all 0.15s ease;
+        }
+        .set-type-help-btn:hover {
+          color: #ffffff;
+          background: rgba(255, 255, 255, 0.1);
+        }
+
+        .set-type-info-banner {
+          background: rgba(59, 130, 246, 0.15);
+          border: 1px solid rgba(59, 130, 246, 0.35);
+          border-radius: 10px;
+          padding: 8px 12px;
+          margin-bottom: 12px;
+          font-size: 12px;
+          color: #93c5fd;
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: 8px;
+        }
+        .set-type-info-close {
+          background: none;
+          border: none;
+          color: #93c5fd;
+          cursor: pointer;
+          font-size: 12px;
+          padding: 2px;
+        }
+
+        .workout-sheet-backdrop {
+          position: fixed;
+          inset: 0;
+          background: rgba(0, 0, 0, 0.78);
+          backdrop-filter: blur(6px);
+          z-index: 12000;
+          display: flex;
+          align-items: flex-end;
+          justify-content: center;
+          padding: 0;
+          animation: fadeInSheet 0.18s ease;
+        }
+        @keyframes fadeInSheet {
+          from { opacity: 0; }
+          to { opacity: 1; }
+        }
+
+        .workout-sheet-container {
+          background: #141824;
+          border: 1px solid #283248;
+          border-bottom: none;
+          border-radius: 24px 24px 0 0;
+          width: 100%;
+          max-width: 480px;
+          padding: 16px 18px 26px;
+          box-shadow: 0 -12px 40px rgba(0, 0, 0, 0.85);
+          animation: slideUpSheet 0.22s cubic-bezier(0.16, 1, 0.3, 1);
+          max-height: 90vh;
+          overflow-y: auto;
+        }
+
+        .workout-sheet-drag-handle {
+          width: 40px;
+          height: 4px;
+          background: #374151;
+          border-radius: 2px;
+          margin: 0 auto 14px;
+        }
+
+        .workout-sheet-header {
+          text-align: center;
+          margin-bottom: 16px;
+          padding-bottom: 12px;
+          border-bottom: 1px solid #232c3d;
+        }
+
+        .workout-sheet-title {
+          font-family: 'Oswald', sans-serif;
+          font-size: 18px;
+          font-weight: 700;
+          color: #ffffff;
+          letter-spacing: 0.5px;
+          text-transform: uppercase;
+        }
+
+        .workout-sheet-date {
+          font-size: 12px;
+          color: #94a3b8;
+          margin-top: 3px;
+        }
+
+        .workout-sheet-options {
+          display: flex;
+          flex-direction: column;
+          gap: 7px;
+        }
+
+        .workout-sheet-btn {
+          width: 100%;
+          background: #1a2030;
+          border: 1px solid #263044;
+          border-radius: 12px;
+          padding: 10px 14px;
+          display: flex;
+          align-items: center;
+          gap: 14px;
+          cursor: pointer;
+          transition: all 0.15s ease;
+          text-align: left;
+        }
+
+        .workout-sheet-btn:hover {
+          background: #222a3e;
+          border-color: #3b82f6;
+          transform: translateY(-1px);
+        }
+
+        .workout-sheet-btn-icon {
+          width: 36px;
+          height: 36px;
+          border-radius: 10px;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          flex-shrink: 0;
+        }
+
+        .workout-sheet-btn-text {
+          display: flex;
+          flex-direction: column;
+          gap: 2px;
+          flex: 1;
+        }
+
+        .workout-sheet-btn-title {
+          font-size: 14px;
+          font-weight: 600;
+          color: #ffffff;
+        }
+
+        .workout-sheet-btn-sub {
+          font-size: 11px;
+          color: #94a3b8;
+        }
+
+        .workout-sheet-btn-danger:hover {
+          border-color: #ef4444;
+          background: rgba(239, 68, 68, 0.12);
+        }
+
+        .workout-sheet-cancel-btn {
+          width: 100%;
+          margin-top: 12px;
+          padding: 12px;
+          background: rgba(255, 255, 255, 0.05);
+          border: 1px solid #283248;
+          border-radius: 12px;
+          color: #94a3b8;
+          font-size: 13.5px;
+          font-weight: 700;
+          cursor: pointer;
+          transition: all 0.15s ease;
+        }
+
+        .workout-sheet-cancel-btn:hover {
+          background: rgba(255, 255, 255, 0.1);
+          color: #ffffff;
         }
         .lift-details-panel {
           margin-top: 8px;
@@ -2360,7 +3503,7 @@ export default function IronLedger() {
           <NavHeaderButton onClick={() => setIsNavDrawerOpen(true)} />
           <span className="global-header-title">
             {activeTab === 'home' ? 'Home' :
-             activeTab === 'library' ? 'Iron Ledger' :
+             activeTab === 'periodisation' ? 'Periodisation Settings' :
              activeTab === 'exercises' ? 'Exercise Library' :
              activeTab === 'explore' ? 'Analytics & Trajectory' : 'Athlete Profile'}
           </span>
@@ -2377,7 +3520,31 @@ export default function IronLedger() {
           mesocycles={mesocycles}
           selectedMesoId={selectedId}
           onSelectMeso={setSelectedId}
+          onDayClick={(mesoId, micId, day, initialEditMode) => openDay(mesoId, micId, day, initialEditMode)}
+          onDeleteDay={(dayId) => clearDay(dayId)}
+          onPerformAgain={(day) => handlePerformAgain(day)}
+        />
+      )}
+
+      {activeTab === 'periodisation' && (
+        <PeriodisationSettingsView
+          macrocycles={macrocycles}
+          mesocycles={mesocycles}
+          today={today}
           onDayClick={(mesoId, micId, day) => openDay(mesoId, micId, day)}
+          onAddMacro={() => setAddingMacro(true)}
+          onAddMeso={(macroId) => {
+            if (macroId) setAddingMesoMacroId(macroId);
+            setAddingMeso(true);
+          }}
+          onAddMicrocycle={(mesoId, built) => addMicrocycleTo(mesoId, built)}
+          onUpdateMeso={updateMesocycle}
+          onDeleteMeso={deleteMesocycle}
+          onDeleteMicrocycle={(mesoId, micId) => deleteMicrocycle(mesoId, micId)}
+          onRenameMicrocycle={(_mesoId, micId, newLabel) => renameMicrocycle(micId, newLabel)}
+          onSetActiveMeso={setActiveMesocycleStatus}
+          onRenameMacro={renameMacrocycle}
+          onDeleteMacro={deleteMacrocycle}
         />
       )}
 
@@ -2403,75 +3570,21 @@ export default function IronLedger() {
         />
       )}
 
-      {activeTab === 'library' && (
-        <>
-          <div className="header">
-            <div>
-              <div className="header-title">Periodization Overview</div>
-              <div className="header-sub">Macrocycle & Mesocycle Blocks</div>
-            </div>
-            <div className="header-stats">
-              <div className="stat">
-                <div className="stat-num">{sessionsLogged}</div>
-                <div className="stat-label">Sessions logged</div>
-              </div>
-              <div className="stat">
-                <div className="stat-num">{prLog.length}</div>
-                <div className="stat-label">PRs on record</div>
-              </div>
-            </div>
-          </div>
-
-          <PRShelf prLog={prLog} />
-
-          <div className="layout">
-            <div>
-              <MacroTimeline
-                macrocycles={macrocycles}
-                mesocycles={mesocycles}
-                selectedId={selectedId}
-                onSelect={setSelectedId}
-                onAddMacro={() => setAddingMacro(true)}
-                onAddMeso={(macroId) => {
-                  setAddingMesoMacroId(macroId);
-                  setAddingMeso(true);
-                }}
-                onDeleteMacro={deleteMacrocycle}
-                onRenameMacro={renameMacrocycle}
-              />
-            </div>
-
-            {selectedMeso && (
-              <MesoDetail
-                meso={selectedMeso}
-                macrocycles={macrocycles}
-                today={today}
-                onDayClick={(day) => {
-                  const mic = selectedMeso.microcycles.find((mc) => mc.days.some((d) => d.id === day.id));
-                  if (mic) openDay(selectedMeso.id, mic.id, day);
-                }}
-                onAddMicrocycle={(built) => addMicrocycleTo(selectedMeso.id, built)}
-                onDeleteMeso={deleteMesocycle}
-                onDeleteMicrocycle={(micId) => deleteMicrocycle(selectedMeso.id, micId)}
-                onUpdateMeso={updateMesocycle}
-                onRenameMicrocycle={renameMicrocycle}
-              />
-            )}
-          </div>
-        </>
-      )}
-
       {activeDay && selectedMeso && !isDayModalMinimized && (
         <DayModal
           day={activeDay.day}
           phaseColor={PHASES[selectedMeso.phaseKey]?.color || "#C1432E"}
-          onClose={() => setIsDayModalMinimized(true)}
+          initialEditMode={activeDay.initialEditMode}
+          isLive={Boolean(activeDay.isLive)}
+          onClose={handleDiscardWorkout}
+          onDiscard={handleDiscardWorkout}
           onSave={(updatedDay) => {
             saveDay(updatedDay);
-            setIsDayModalMinimized(false);
           }}
           onDelete={(dayId) => {
             clearDay(dayId);
+            setActiveDay(null);
+            setLiveWorkout(null);
             setIsDayModalMinimized(false);
           }}
           onUpdateDraft={(updatedDay) => {
@@ -2480,21 +3593,50 @@ export default function IronLedger() {
           onGoToExerciseLibrary={() => {
             setIsDayModalMinimized(true);
             setActiveTab('exercises');
+            setActiveDay((prev) => prev ? { ...prev, initialEditMode: true } : null);
           }}
+          onPerformAgain={(d) => handlePerformAgain(d)}
         />
       )}
 
-      {showResumeDiscardPrompt && activeDay && (
+      {showResumeDiscardPrompt && liveWorkout && (
         <ResumeOrDiscardModal
-          activeDayTitle={activeDay.day.title}
-          activeDayDate={activeDay.day.date}
+          activeDayTitle={liveWorkout.day.title}
+          activeDayDate={liveWorkout.day.date}
           onClose={() => setShowResumeDiscardPrompt(false)}
           onResume={() => {
             setShowResumeDiscardPrompt(false);
+            setActiveDay({ ...liveWorkout, isLive: true });
             setIsDayModalMinimized(false);
           }}
           onDiscard={() => {
             setShowResumeDiscardPrompt(false);
+            if (liveWorkout) {
+              const wasEmpty = !liveWorkout.originalDay || liveWorkout.originalDay.type === "empty" || (!liveWorkout.originalDay.title && (!liveWorkout.originalDay.lifts || liveWorkout.originalDay.lifts.length === 0));
+              if (wasEmpty) {
+                clearDay(liveWorkout.day.id);
+              } else if (liveWorkout.originalDay) {
+                const orig = liveWorkout.originalDay;
+                setMesocycles((prev) =>
+                  prev.map((m) =>
+                    m.id !== liveWorkout.mesoId
+                      ? m
+                      : {
+                          ...m,
+                          microcycles: m.microcycles.map((mc) =>
+                            mc.id !== liveWorkout.micId
+                              ? mc
+                              : {
+                                  ...mc,
+                                  days: mc.days.map((d) => (d.id === orig.id ? orig : d)),
+                                }
+                          ),
+                        }
+                  )
+                );
+              }
+            }
+            setLiveWorkout(null);
             setActiveDay(null);
             setIsDayModalMinimized(false);
             handleStartNewWorkout();
@@ -2504,7 +3646,11 @@ export default function IronLedger() {
 
       {addingMeso && (
         <AddMesocycleModal
-          lastEnd={mesocycles[mesocycles.length - 1]?.end || today}
+          lastEnd={(() => {
+            const tMacroId = addingMesoMacroId || (selectedMeso && selectedMeso.macroId) || macrocycles[macrocycles.length - 1]?.id;
+            const macroMesos = mesocycles.filter((m) => m.macroId === tMacroId);
+            return macroMesos.length > 0 ? macroMesos[macroMesos.length - 1].end : (mesocycles[mesocycles.length - 1]?.end || today);
+          })()}
           macrocycles={macrocycles}
           defaultMacroId={addingMesoMacroId || (selectedMeso && selectedMeso.macroId) || macrocycles[macrocycles.length - 1]?.id}
           onClose={() => { setAddingMeso(false); setAddingMesoMacroId(null); }}
@@ -2526,9 +3672,14 @@ export default function IronLedger() {
         activeTab={activeTab}
         onSelectTab={setActiveTab}
         onStartWorkout={handleStartWorkoutClick}
-        isWorkoutMinimized={activeDay !== null && isDayModalMinimized}
-        activeWorkoutTitle={activeDay?.day.title || "Workout Session"}
-        onResumeWorkout={() => setIsDayModalMinimized(false)}
+        isWorkoutMinimized={liveWorkout !== null && isDayModalMinimized}
+        activeWorkoutTitle={liveWorkout?.day.title || "Workout Session"}
+        onResumeWorkout={() => {
+          if (liveWorkout) {
+            setActiveDay({ ...liveWorkout, isLive: true });
+          }
+          setIsDayModalMinimized(false);
+        }}
         isOpen={isNavDrawerOpen}
         onClose={() => setIsNavDrawerOpen(false)}
       />

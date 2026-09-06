@@ -1,7 +1,7 @@
 import React from 'react';
-import { Home, Library, Dumbbell, Search, User, Menu, X, Play, Clock } from 'lucide-react';
+import { Home, Dumbbell, Search, User, Menu, X, Play, Clock, CalendarRange } from 'lucide-react';
 
-export type TabType = 'library' | 'home' | 'exercises' | 'explore' | 'you';
+export type TabType = 'home' | 'periodisation' | 'exercises' | 'explore' | 'you';
 
 interface SidebarNavProps {
   activeTab: TabType;
@@ -291,14 +291,14 @@ export const SidebarNav: React.FC<SidebarNavProps> = ({
             <span>Home</span>
           </button>
 
-          {/* 2. Periodization Library */}
+          {/* 2. Periodisation Settings */}
           <button
             type="button"
-            onClick={() => handleTabClick('library')}
-            className={`drawer-nav-item ${activeTab === 'library' ? 'drawer-nav-item-active' : ''}`}
+            onClick={() => handleTabClick('periodisation')}
+            className={`drawer-nav-item ${activeTab === 'periodisation' ? 'drawer-nav-item-active' : ''}`}
           >
-            <Library className="w-5 h-5 text-amber-500 flex-shrink-0" />
-            <span>Periodization Library</span>
+            <CalendarRange className="w-5 h-5 text-rose-400 flex-shrink-0" />
+            <span>Periodisation Settings</span>
           </button>
 
           {/* 3. Exercise Library (Kanban Board) */}

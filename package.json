@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
+    "sync": "npm run build && node node_modules/@capacitor/cli/bin/capacitor sync android",
     "lint": "oxlint",
     "preview": "vite preview"
   },
@@ -18,6 +19,7 @@
     "lucide-react": "^1.34.0",
     "react": "^19.2.8",
     "react-dom": "^19.2.8",
+    "react-muscle-highlighter": "^1.2.0",
     "tailwindcss": "^4.3.3"
   },
   "devDependencies": {

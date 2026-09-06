@@ -35,37 +35,10 @@ export const ExerciseIllustration: React.FC<ExerciseIllustrationProps> = ({
       return;
     }
 
-    if (!cleanName) return;
-
-    if (gifCache[cleanName]) {
+    if (cleanName && gifCache[cleanName]) {
       setImgUrl(gifCache[cleanName]);
       return;
     }
-
-    let isMounted = true;
-    const fetchApiGif = async () => {
-      try {
-        const res = await fetch(`https://oss.exercisedb.dev/api/v1/exercises?name=${encodeURIComponent(cleanName)}`);
-        if (res.ok) {
-          const json = await res.json();
-          if (json.success && Array.isArray(json.data) && json.data.length > 0) {
-            const match = json.data.find((ex: any) => ex.name.toLowerCase() === cleanName) || json.data[0];
-            if (match && match.gifUrl && isMounted) {
-              gifCache[cleanName] = match.gifUrl;
-              setImgUrl(match.gifUrl);
-            }
-          }
-        }
-      } catch (e) {
-        // silent catch
-      }
-    };
-
-    fetchApiGif();
-
-    return () => {
-      isMounted = false;
-    };
   }, [cleanName, gifUrl]);
 
   if (imgUrl && !hasError) {

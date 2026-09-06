@@ -1,6 +1,13 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
-import { Search, Dumbbell, RefreshCw, Info, Check, Layers, X, Bookmark, Plus, Trash2 } from 'lucide-react';
-import { FALLBACK_EXERCISES } from '../data/exerciseLibraryData';
+import { Search, Dumbbell, RefreshCw, Info, Check, Layers, X, Bookmark, Plus, Trash2, Flame } from 'lucide-react';
+import {
+  fetchLyftaExercises,
+  LYFTA_BODY_PART_OPTIONS,
+  LYFTA_EQUIPMENT_OPTIONS,
+  LYFTA_TARGET_MUSCLE_OPTIONS,
+} from '../services/lyftaApi';
+import { BodyAnatomyView, SLUG_TO_LYFTA_MAP } from './BodyAnatomyView';
+import type { Slug } from 'react-muscle-highlighter';
 
 export interface ExerciseDBItem {
   exerciseId: string;
@@ -12,33 +19,6 @@ export interface ExerciseDBItem {
   secondaryMuscles?: string[];
   instructions?: string[];
 }
-
-const BODY_PART_OPTIONS = [
-  { value: 'all', label: 'All Body Parts' },
-  { value: 'chest', label: 'Chest' },
-  { value: 'back', label: 'Back' },
-  { value: 'shoulders', label: 'Shoulders' },
-  { value: 'upper arms', label: 'Upper Arms (Biceps/Triceps)' },
-  { value: 'lower arms', label: 'Forearms / Lower Arms' },
-  { value: 'upper legs', label: 'Quads & Hamstrings' },
-  { value: 'lower legs', label: 'Calves / Lower Legs' },
-  { value: 'waist', label: 'Core / Waist' },
-  { value: 'cardio', label: 'Cardio' },
-];
-
-const EQUIPMENT_OPTIONS = [
-  { value: 'all', label: 'All Equipment' },
-  { value: 'barbell', label: 'Barbell' },
-  { value: 'dumbbell', label: 'Dumbbell' },
-  { value: 'cable', label: 'Cable' },
-  { value: 'body weight', label: 'Body Weight' },
-  { value: 'lever machine', label: 'Lever Machine' },
-  { value: 'assisted', label: 'Assisted' },
-  { value: 'band', label: 'Resistance Band' },
-  { value: 'smith machine', label: 'Smith Machine' },
-  { value: 'ez barbell', label: 'EZ Barbell' },
-  { value: 'kettlebell', label: 'Kettlebell' },
-];
 
 interface ExerciseKanbanViewProps {
   onSelectExercise?: (exerciseName: string, gifUrl?: string) => void;
@@ -67,41 +47,45 @@ export const ExerciseKanbanView: React.FC<ExerciseKanbanViewProps> = ({
   const [isAddModalOpen, setIsAddModalOpen] = useState(false);
   const [newExerciseForm, setNewExerciseForm] = useState({
     name: '',
-    bodyPart: 'chest',
-    equipment: 'barbell',
+    bodyPart: 'Chest',
+    equipment: 'Barbell',
     targetMuscle: '',
     secondaryMuscles: '',
     gifUrl: '',
     instructions: '',
   });
 
-  const filterCombinedExercises = (s: string, bp: string, eq: string, customList = customExercises): ExerciseDBItem[] => {
-    const all = [...customList, ...FALLBACK_EXERCISES];
-    return all.filter((ex) => {
+  const filterCustomExercises = (
+    s: string,
+    bp: string,
+    eq: string,
+    tm: string = 'all',
+    customList = customExercises
+  ): ExerciseDBItem[] => {
+    return customList.filter((ex) => {
       const matchSearch =
         !s.trim() ||
         ex.name.toLowerCase().includes(s.toLowerCase()) ||
         ex.targetMuscles?.some((m) => m.toLowerCase().includes(s.toLowerCase()));
-      const matchBp = bp === 'all' || ex.bodyParts.includes(bp);
-      const matchEq = eq === 'all' || ex.equipments.includes(eq);
-      return matchSearch && matchBp && matchEq;
+      const matchBp = bp === 'all' || ex.bodyParts.some((p) => p.toLowerCase() === bp.toLowerCase());
+      const matchEq = eq === 'all' || ex.equipments.some((e) => e.toLowerCase() === eq.toLowerCase());
+      const matchTm =
+        tm === 'all' ||
+        ex.targetMuscles?.some((m) => m.toLowerCase().includes(tm.toLowerCase())) ||
+        ex.secondaryMuscles?.some((m) => m.toLowerCase().includes(tm.toLowerCase()));
+      return matchSearch && matchBp && matchEq && matchTm;
     });
   };
 
-  const [exercises, setExercises] = useState<ExerciseDBItem[]>(() => {
-    try {
-      const saved = localStorage.getItem('custom_exercises');
-      const parsed: ExerciseDBItem[] = saved ? JSON.parse(saved) : [];
-      return [...parsed, ...FALLBACK_EXERCISES];
-    } catch (e) {
-      return FALLBACK_EXERCISES;
-    }
-  });
+  const [exercises, setExercises] = useState<ExerciseDBItem[]>([]);
   const [loading, setLoading] = useState(false);
   const [search, setSearch] = useState('');
   const [bodyPart, setBodyPart] = useState('all');
+  const [targetMuscle, setTargetMuscle] = useState('all');
   const [equipment, setEquipment] = useState('all');
-  const [cursor, setCursor] = useState<string | null>(null);
+  const [selectedMuscleSlug, setSelectedMuscleSlug] = useState<Slug | null>(null);
+  const [showAnatomyModel, setShowAnatomyModel] = useState<boolean>(true);
+  const [offset, setOffset] = useState<number>(0);
   const [hasNextPage, setHasNextPage] = useState(false);
   const [totalCount, setTotalCount] = useState<number | null>(null);
   const [selectedExerciseModal, setSelectedExerciseModal] = useState<ExerciseDBItem | null>(null);
@@ -201,84 +185,56 @@ export const ExerciseKanbanView: React.FC<ExerciseKanbanViewProps> = ({
 
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  const fetchExerciseDB = async (reset: boolean = false, nextCursor: string | null = null) => {
+  const fetchLyftaLibrary = async (reset: boolean = false, nextOffset: number = 0) => {
     setLoading(true);
     try {
-      let url = `https://oss.exercisedb.dev/api/v1/exercises?limit=40`;
-      const params: string[] = [];
-      if (search.trim()) params.push(`name=${encodeURIComponent(search.trim())}`);
-      if (bodyPart !== 'all') params.push(`bodyParts=${encodeURIComponent(bodyPart)}`);
-      if (equipment !== 'all') params.push(`equipments=${encodeURIComponent(equipment)}`);
-      if (nextCursor) params.push(`after=${nextCursor}`);
+      const result = await fetchLyftaExercises({
+        search,
+        bodyPart,
+        equipment,
+        targetMuscle,
+        offset: nextOffset,
+        limit: 40,
+      });
 
-      if (params.length > 0) {
-        url += `&${params.join('&')}`;
+      const matchingCustom = filterCustomExercises(search, bodyPart, equipment, targetMuscle, customExercises);
+      const fetchedItems = result.exercises || [];
+
+      if (reset) {
+        setExercises([...matchingCustom, ...fetchedItems]);
+      } else {
+        setExercises((prev) => {
+          const existingIds = new Set(prev.map((p) => p.exerciseId));
+          const newItems = fetchedItems.filter((f) => !existingIds.has(f.exerciseId));
+          return [...prev, ...newItems];
+        });
       }
-
-      const res = await fetch(url);
-      if (res.ok) {
-        const json = await res.json();
-        if (json.success && Array.isArray(json.data) && json.data.length > 0) {
-          const matchingCustom = customExercises.filter((ex) => {
-            const matchSearch =
-              !search.trim() ||
-              ex.name.toLowerCase().includes(search.toLowerCase()) ||
-              ex.targetMuscles?.some((m) => m.toLowerCase().includes(search.toLowerCase()));
-            const matchBp = bodyPart === 'all' || ex.bodyParts.includes(bodyPart);
-            const matchEq = equipment === 'all' || ex.equipments.includes(equipment);
-            return matchSearch && matchBp && matchEq;
-          });
-
-          if (reset) {
-            setExercises([...matchingCustom, ...json.data]);
-          } else {
-            setExercises((prev) => [...prev, ...json.data]);
-          }
-          setCursor(json.meta?.nextCursor || null);
-          setHasNextPage(!!json.meta?.hasNextPage);
-          if (json.meta?.total !== undefined) {
-            setTotalCount(json.meta.total);
-          }
-          setLoading(false);
-          return;
-        }
+      setOffset(nextOffset + fetchedItems.length);
+      setHasNextPage(result.hasMore);
+      if (result.total !== undefined) {
+        setTotalCount(result.total + matchingCustom.length);
       }
     } catch (err) {
-      console.error('Error fetching exercises from ExerciseDB API:', err);
+      console.error('Error fetching exercises from Lyfta API:', err);
+    } finally {
+      setLoading(false);
     }
-
-    // Fallback if API fails or returns no data
-    const fallbackList = filterCombinedExercises(search, bodyPart, equipment, customExercises);
-    if (reset) {
-      setExercises(fallbackList);
-    } else {
-      setExercises((prev) => {
-        const existingIds = new Set(prev.map((p) => p.exerciseId));
-        const newItems = fallbackList.filter((f) => !existingIds.has(f.exerciseId));
-        return [...prev, ...newItems];
-      });
-    }
-    setHasNextPage(false);
-    setLoading(false);
   };
 
   useEffect(() => {
-    // Immediately filter local exercises for crisp UI responsiveness
-    setExercises(filterCombinedExercises(search, bodyPart, equipment, customExercises));
-
     if (debounceRef.current) clearTimeout(debounceRef.current);
     debounceRef.current = setTimeout(() => {
-      fetchExerciseDB(true, null);
-    }, 350);
+      fetchLyftaLibrary(true, 0);
+    }, 250);
 
     return () => {
       if (debounceRef.current) clearTimeout(debounceRef.current);
     };
-  }, [search, bodyPart, equipment, customExercises]);
+  }, [search, bodyPart, equipment, targetMuscle, customExercises]);
 
   const loadMore = () => {
-    if (cursor && !loading) {
-      fetchExerciseDB(false, cursor);
+    if (!loading && hasNextPage) {
+      fetchLyftaLibrary(false, offset);
     }
   };
 
@@ -369,8 +325,14 @@ export const ExerciseKanbanView: React.FC<ExerciseKanbanViewProps> = ({
 
         .n2-filter-grid {
           display: grid;
-          grid-template-columns: 1.5fr 1fr 1fr;
+          grid-template-columns: 1.6fr 1.1fr 1.1fr 1.1fr;
           gap: 10px;
+        }
+
+        @media (max-width: 960px) {
+          .n2-filter-grid {
+            grid-template-columns: 1fr 1fr;
+          }
         }
 
         .n2-search-box {
@@ -465,16 +427,16 @@ export const ExerciseKanbanView: React.FC<ExerciseKanbanViewProps> = ({
         }
 
         .n2-selected-badge {
-          font-size: 10.5px;
-          font-weight: 800;
-          color: #60a5fa;
-          background: rgba(59, 130, 246, 0.18);
-          border: 1px solid rgba(59, 130, 246, 0.4);
-          padding: 2px 8px;
+          color: #ffffff;
+          background: linear-gradient(135deg, #2563eb 0%, #1d4ed8 100%);
+          border: 1px solid #60a5fa;
+          width: 22px;
+          height: 22px;
           border-radius: 6px;
           display: inline-flex;
           align-items: center;
-          gap: 4px;
+          justify-content: center;
+          box-shadow: 0 2px 8px rgba(37, 99, 235, 0.4);
         }
 
         .n2-custom-badge {
@@ -792,6 +754,30 @@ export const ExerciseKanbanView: React.FC<ExerciseKanbanViewProps> = ({
           </h1>
 
           <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+            {/* Toggle Anatomy Visualizer Button */}
+            <button
+              type="button"
+              onClick={() => setShowAnatomyModel(!showAnatomyModel)}
+              style={{
+                background: showAnatomyModel ? 'rgba(244, 63, 94, 0.2)' : 'rgba(255, 255, 255, 0.08)',
+                border: showAnatomyModel ? '1px solid #f43f5e' : '1px solid #2d374e',
+                color: showAnatomyModel ? '#fda4af' : '#cbd5e1',
+                padding: '8px 12px',
+                borderRadius: '10px',
+                fontSize: '12px',
+                fontWeight: 700,
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: '6px',
+                cursor: 'pointer',
+                transition: 'all 0.2s ease',
+              }}
+              title="Toggle Interactive Muscle Anatomy Model"
+            >
+              <Flame className="w-4 h-4 text-rose-500" />
+              <span>{showAnatomyModel ? 'Hide Anatomy' : 'Anatomy Model'}</span>
+            </button>
+
             <button
               type="button"
               onClick={() => setIsAddModalOpen(true)}
@@ -826,6 +812,23 @@ export const ExerciseKanbanView: React.FC<ExerciseKanbanViewProps> = ({
           </div>
         </div>
 
+        {/* Interactive Human Muscle Anatomy Model */}
+        {showAnatomyModel && (
+          <BodyAnatomyView
+            selectedSlug={selectedMuscleSlug}
+            onSelectMuscle={(slug, lyftaBp, lyftaTm) => {
+              setSelectedMuscleSlug(slug);
+              setBodyPart(lyftaBp);
+              setTargetMuscle(lyftaTm || 'all');
+            }}
+            onClear={() => {
+              setSelectedMuscleSlug(null);
+              setBodyPart('all');
+              setTargetMuscle('all');
+            }}
+          />
+        )}
+
         <div className="n2-filter-grid">
           
           {/* Search Field */}
@@ -840,13 +843,40 @@ export const ExerciseKanbanView: React.FC<ExerciseKanbanViewProps> = ({
             />
           </div>
 
-          {/* Body Part Selector */}
+          {/* Muscle / Body Part Selector */}
           <select
             value={bodyPart}
-            onChange={(e) => setBodyPart(e.target.value)}
+            onChange={(e) => {
+              const val = e.target.value;
+              setBodyPart(val);
+              setTargetMuscle('all');
+              if (val === 'all') {
+                setSelectedMuscleSlug(null);
+              } else {
+                const match = Object.entries(SLUG_TO_LYFTA_MAP).find(
+                  ([, m]) => m.bodyPart.toLowerCase() === val.toLowerCase()
+                );
+                setSelectedMuscleSlug((match ? match[0] : null) as any);
+              }
+            }}
             className="n2-select-dropdown"
+            title="Filter by Muscle / Body Part"
           >
-            {BODY_PART_OPTIONS.map((opt) => (
+            {LYFTA_BODY_PART_OPTIONS.map((opt) => (
+              <option key={opt.value} value={opt.value}>
+                {opt.label}
+              </option>
+            ))}
+          </select>
+
+          {/* Target Muscle Selector */}
+          <select
+            value={targetMuscle}
+            onChange={(e) => setTargetMuscle(e.target.value)}
+            className="n2-select-dropdown"
+            title="Filter by Specific Target Muscle"
+          >
+            {LYFTA_TARGET_MUSCLE_OPTIONS.map((opt) => (
               <option key={opt.value} value={opt.value}>
                 {opt.label}
               </option>
@@ -858,8 +888,9 @@ export const ExerciseKanbanView: React.FC<ExerciseKanbanViewProps> = ({
             value={equipment}
             onChange={(e) => setEquipment(e.target.value)}
             className="n2-select-dropdown"
+            title="Filter by Equipment"
           >
-            {EQUIPMENT_OPTIONS.map((opt) => (
+            {LYFTA_EQUIPMENT_OPTIONS.map((opt) => (
               <option key={opt.value} value={opt.value}>
                 {opt.label}
               </option>
@@ -873,7 +904,7 @@ export const ExerciseKanbanView: React.FC<ExerciseKanbanViewProps> = ({
       {loading && exercises.length === 0 && (
         <div style={{ textAlign: 'center', padding: '50px 0', color: '#94a3b8' }}>
           <RefreshCw className="w-6 h-6 text-rose-500 animate-spin inline mb-2" />
-          <div>Fetching exercises from ExerciseDB...</div>
+          <div>Fetching exercises from Lyfta Library...</div>
         </div>
       )}
 
@@ -909,8 +940,8 @@ export const ExerciseKanbanView: React.FC<ExerciseKanbanViewProps> = ({
                     <span className="n2-custom-badge">Custom</span>
                   )}
                   {isSel && (
-                    <span className="n2-selected-badge">
-                      <Check className="w-3.5 h-3.5" /> Selected
+                    <span className="n2-selected-badge" title="Selected">
+                      <Check className="w-3.5 h-3.5 stroke-[2.5px]" />
                     </span>
                   )}
                 </div>
@@ -971,7 +1002,7 @@ export const ExerciseKanbanView: React.FC<ExerciseKanbanViewProps> = ({
         })}
       </div>
 
-      {/* Load More Exercises Button (Fetches all 1,500+ from ExerciseDB API) */}
+      {/* Load More Exercises Button (Fetches all 7,600+ from Lyfta API) */}
       {hasNextPage && (
         <button
           type="button"
@@ -987,7 +1018,7 @@ export const ExerciseKanbanView: React.FC<ExerciseKanbanViewProps> = ({
           ) : (
             <>
               <Layers className="w-4 h-4 text-rose-400" />
-              Load More Exercises (1,500+ Total DB)
+              Load More Exercises ({totalCount ? `${totalCount.toLocaleString()}+ Total Library` : '7,600+ Total Library'})
             </>
           )}
         </button>
@@ -1170,7 +1201,7 @@ export const ExerciseKanbanView: React.FC<ExerciseKanbanViewProps> = ({
                       className="n2-select-dropdown"
                       style={{ marginTop: '5px' }}
                     >
-                      {BODY_PART_OPTIONS.filter((o) => o.value !== 'all').map((opt) => (
+                      {LYFTA_BODY_PART_OPTIONS.filter((o) => o.value !== 'all').map((opt) => (
                         <option key={opt.value} value={opt.value}>
                           {opt.label}
                         </option>
@@ -1188,7 +1219,7 @@ export const ExerciseKanbanView: React.FC<ExerciseKanbanViewProps> = ({
                       className="n2-select-dropdown"
                       style={{ marginTop: '5px' }}
                     >
-                      {EQUIPMENT_OPTIONS.filter((o) => o.value !== 'all').map((opt) => (
+                      {LYFTA_EQUIPMENT_OPTIONS.filter((o) => o.value !== 'all').map((opt) => (
                         <option key={opt.value} value={opt.value}>
                           {opt.label}
                         </option>

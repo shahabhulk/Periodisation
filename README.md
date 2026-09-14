@@ -50,9 +50,8 @@ Packaged as a lightning-fast web application and native Android app via **Capaci
 
 ### 📈 5. In-Depth Analytics & Readiness Journaling
 * **Volume & Intensity Curves**: Dynamic progression charts for load, volume load, and rep ranges over time.
-* **Readiness & State of Mind**: Track daily fatigue, mental state ("Jihad al nafs", readiness scores), and physio recovery notes.
+* **Readiness & State of Mind**: Track daily fatigue, mental state  and physio recovery notes.
 * **Nutrition & Diet Logging**: Integrated daily meal and macro tracking alongside lifting performance.
-* **Discipline & Habit Tracker**: Daily task completion checklists to build accountability outside the rack.
 
 ### 🔒 6. Privacy & Data Sovereignty
 * **100% Offline-First**: Zero mandatory cloud login. All data persists securely in client-side `localStorage`.

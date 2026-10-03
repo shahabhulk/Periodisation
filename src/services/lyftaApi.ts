@@ -592,3 +592,188 @@ export async function fetchLyftaExercises(
     hasMore,
   };
 }
+
+/**
+ * Find exercise details by name from catalog
+ */
+export function findExerciseDetails(name: string): ExerciseDBItem | null {
+  if (!name) return null;
+  const nLow = name.trim().toLowerCase();
+  return (
+    masterCatalog.find((x) => x.name.toLowerCase() === nLow) ||
+    masterCatalog.find((x) => x.name.toLowerCase().includes(nLow) || nLow.includes(x.name.toLowerCase())) ||
+    null
+  );
+}
+
+/**
+ * Exercise Progress Data Structure Interfaces matching GET /api/v1/exercises/progress
+ */
+export interface LyftaExerciseProgressDataPoint {
+  date: string; // "YYYY-MM-DD"
+  best_weight: number;
+  best_reps: number;
+  best_volume: number;
+  estimated_rm: string | number;
+}
+
+export interface LyftaExerciseProgressResponse {
+  status: boolean;
+  weight_unit: string;
+  data: LyftaExerciseProgressDataPoint[];
+  message?: string;
+  isMockFallback?: boolean;
+}
+
+export interface FetchLyftaProgressOptions {
+  exerciseId: number | string;
+  duration?: number; // duration in days, e.g. 30, 90, 180, 365, 730
+  clientId?: string;
+}
+
+/**
+ * Generates realistic fallback progress trajectory data when API is unauthenticated or offline
+ */
+export function getFallbackExerciseProgress(
+  exerciseId: number | string,
+  durationDays: number = 365
+): LyftaExerciseProgressResponse {
+  const exIdNum = typeof exerciseId === 'string'
+    ? parseInt(exerciseId.replace('lyfta-', ''), 10) || 2
+    : exerciseId;
+
+  // Base configurations for popular exercise IDs
+  let baseWeight = 110;
+  let weightGain = 20;
+  let repRange = [3, 8];
+
+  if (exIdNum === 1 || exIdNum === 31) {
+    // Squat
+    baseWeight = 120;
+    weightGain = 25;
+  } else if (exIdNum === 7 || exIdNum === 71) {
+    // Deadlift
+    baseWeight = 140;
+    weightGain = 30;
+  } else if (exIdNum === 4 || exIdNum === 40) {
+    // Dumbbell Bench / Press
+    baseWeight = 45;
+    weightGain = 15;
+    repRange = [6, 12];
+  } else if (exIdNum === 5 || exIdNum === 50) {
+    // Overhead Press
+    baseWeight = 60;
+    weightGain = 15;
+  }
+
+  const points: LyftaExerciseProgressDataPoint[] = [];
+  const today = new Date();
+  const numSamples = Math.min(18, Math.max(5, Math.floor(durationDays / 20)));
+
+  for (let i = numSamples - 1; i >= 0; i--) {
+    const daysAgo = Math.floor((i / (numSamples - 1 || 1)) * durationDays * 0.9);
+    const d = new Date(today.getTime() - daysAgo * 24 * 60 * 60 * 1000);
+    const dateStr = d.toISOString().slice(0, 10);
+
+    const progressRatio = 1 - i / (numSamples - 1 || 1);
+    const weight = Math.round(baseWeight + progressRatio * weightGain + (i % 3 === 0 ? 2.5 : 0));
+    const reps = repRange[0] + (i % (repRange[1] - repRange[0] + 1));
+    const est1RM = Math.round(weight * (1 + reps / 30));
+    const bestVolume = Math.round(weight * reps * 4);
+
+    points.push({
+      date: dateStr,
+      best_weight: weight,
+      best_reps: reps,
+      best_volume: bestVolume,
+      estimated_rm: String(est1RM),
+    });
+  }
+
+  return {
+    status: true,
+    weight_unit: 'kg',
+    data: points,
+    isMockFallback: true,
+  };
+}
+
+/**
+ * Fetch best-set exercise progress from official Lyfta API GET /api/v1/exercises/progress
+ */
+export async function fetchLyftaExerciseProgress(
+  options: FetchLyftaProgressOptions
+): Promise<LyftaExerciseProgressResponse> {
+  const { exerciseId, duration = 365, clientId } = options;
+  const apiKey = getLyftaApiKey();
+
+  const numericId = typeof exerciseId === 'string'
+    ? parseInt(exerciseId.replace('lyfta-', ''), 10) || 2
+    : exerciseId;
+
+  const isNative = Capacitor.isNativePlatform();
+  const isDev = import.meta.env.DEV;
+
+  let query = `exercise_id=${numericId}&duration=${duration}`;
+  if (clientId) {
+    query += `&client_id=${encodeURIComponent(clientId)}`;
+  }
+
+  let url = `https://my.lyfta.app/api/v1/exercises/progress?${query}`;
+  if (!isNative && isDev) {
+    url = `/lyfta-api/api/v1/exercises/progress?${query}`;
+  }
+
+  const headers: Record<string, string> = {
+    Authorization: `Bearer ${apiKey}`,
+    Accept: 'application/json',
+  };
+
+  try {
+    if (Date.now() >= rateLimitCooldownUntil) {
+      if (isNative) {
+        const res = await CapacitorHttp.get({ url, headers });
+        if (res.status === 429) {
+          setRateLimitCooldown();
+        } else if (res.status >= 200 && res.status < 300) {
+          const json = typeof res.data === 'string' ? JSON.parse(res.data) : res.data;
+          if (json && (json.status || json.data) && Array.isArray(json.data) && json.data.length > 0) {
+            return {
+              status: true,
+              weight_unit: json.weight_unit || 'kg',
+              data: json.data,
+              isMockFallback: false,
+            };
+          }
+        }
+      } else {
+        const res = await fetch(url, { headers });
+        if (res.status === 429) {
+          setRateLimitCooldown();
+        } else if (res.ok) {
+          const json = await res.json();
+          if (json && (json.status || json.data) && Array.isArray(json.data) && json.data.length > 0) {
+            return {
+              status: true,
+              weight_unit: json.weight_unit || 'kg',
+              data: json.data,
+              isMockFallback: false,
+            };
+          }
+        }
+      }
+    }
+  } catch (err) {
+    console.warn('Lyfta exercise progress API request failed:', err);
+  }
+
+  // Return empty data if live API request fails or is rate limited
+  return {
+    status: false,
+    weight_unit: 'kg',
+    data: [],
+    isMockFallback: false,
+  };
+}
+
+

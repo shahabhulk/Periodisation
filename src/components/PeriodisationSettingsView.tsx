@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import {
   Plus,
   Calendar,
@@ -12,7 +12,19 @@ import {
   Check,
   BatteryCharging,
   AlertCircle,
+  TrendingUp,
+  MoreVertical,
+  Target,
+  FileText,
+  CheckCircle2,
+  Circle,
+  X,
+  Edit3,
 } from 'lucide-react';
+import confetti from 'canvas-confetti';
+import { formatDateDMY } from '../utils/workoutUtils';
+import { PeriodisationAnalysisView } from './PeriodisationAnalysisView';
+import type { PhaseTarget } from '../types/workout';
 
 const PHASES: Record<string, { color: string; label: string; description: string }> = {
   Hypertrophy: {
@@ -54,13 +66,15 @@ function addDays(dateStr: string, n: number) {
 }
 
 function fmtDate(dateStr: string) {
+  if (!dateStr) return "";
   const d = new Date(dateStr + "T00:00:00Z");
-  return d.toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric", timeZone: "UTC" });
+  if (isNaN(d.getTime())) return formatDateDMY(dateStr);
+  const weekday = d.toLocaleDateString("en-GB", { weekday: "short", timeZone: "UTC" });
+  return `${weekday}, ${formatDateDMY(dateStr)}`;
 }
 
 function fmtDateShort(dateStr: string) {
-  const d = new Date(dateStr + "T00:00:00Z");
-  return d.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "2-digit", timeZone: "UTC" });
+  return formatDateDMY(dateStr);
 }
 
 export interface SetEntry {
@@ -78,6 +92,8 @@ export interface LiftEntry {
   gifUrl?: string;
   unit: string;
   sets: SetEntry[];
+  e1rm?: string | number;
+  laterality?: 'bi' | 'uni';
 }
 
 export interface DayEntry {
@@ -96,6 +112,7 @@ export interface Microcycle {
   index: number;
   label: string | null;
   days: DayEntry[];
+  note?: string;
 }
 
 export interface Mesocycle {
@@ -109,6 +126,8 @@ export interface Mesocycle {
   end: string;
   status: string;
   microcycles: Microcycle[];
+  targets?: PhaseTarget[];
+  notes?: string;
 }
 
 export interface Macrocycle {
@@ -126,10 +145,18 @@ interface PeriodisationSettingsViewProps {
   onAddMacro: () => void;
   onAddMeso: (macroId?: string) => void;
   onAddMicrocycle: (mesoId: string, built: Microcycle) => void;
-  onUpdateMeso: (mesoId: string, updates: { name: string; phaseKey: string; start: string; macroId: string }) => void;
+  onUpdateMeso: (mesoId: string, updates: { 
+    name: string; 
+    phaseKey: string; 
+    start: string; 
+    macroId: string;
+    targets?: PhaseTarget[];
+    notes?: string;
+  }) => void;
   onDeleteMeso: (mesoId: string) => void;
   onDeleteMicrocycle: (mesoId: string, micId: string) => void;
   onRenameMicrocycle: (mesoId: string, micId: string, newLabel: string) => void;
+  onUpdateMicrocycleNote?: (mesoId: string, micId: string, note: string) => void;
   onSetActiveMeso?: (mesoId: string) => void;
   onRenameMacro?: (macroId: string, newName: string) => void;
   onDeleteMacro?: (macroId: string) => void;
@@ -147,6 +174,7 @@ export const PeriodisationSettingsView: React.FC<PeriodisationSettingsViewProps>
   onDeleteMeso,
   onDeleteMicrocycle,
   onRenameMicrocycle,
+  onUpdateMicrocycleNote,
   onSetActiveMeso: _onSetActiveMeso,
   onRenameMacro,
   onDeleteMacro,
@@ -155,6 +183,7 @@ export const PeriodisationSettingsView: React.FC<PeriodisationSettingsViewProps>
   const [selectedMacroId, setSelectedMacroId] = useState<string | null>(null);
   const [selectedMesoId, setSelectedMesoId] = useState<string | null>(null);
   const [selectionLevel, setSelectionLevel] = useState<'none' | 'macrocycle' | 'mesocycle'>('mesocycle');
+  const [activeSubTab, setActiveSubTab] = useState<'planner' | 'analytics'>('planner');
 
   // Date-synced status calculation
   const getPhaseStatus = (start: string, end: string) => {
@@ -220,6 +249,65 @@ export const PeriodisationSettingsView: React.FC<PeriodisationSettingsViewProps>
   const [editStart, setEditStart] = useState("");
   const [editMacroId, setEditMacroId] = useState("");
 
+  // Dropdown menu for Edit & Delete on active meso
+  const [isMesoMenuOpen, setIsMesoMenuOpen] = useState(false);
+  const mesoMenuRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    function handleClickOutside(event: MouseEvent) {
+      if (mesoMenuRef.current && !mesoMenuRef.current.contains(event.target as Node)) {
+        setIsMesoMenuOpen(false);
+      }
+    }
+    if (isMesoMenuOpen) {
+      document.addEventListener("mousedown", handleClickOutside);
+    }
+    return () => {
+      document.removeEventListener("mousedown", handleClickOutside);
+    };
+  }, [isMesoMenuOpen]);
+
+  // Microcycle 3-dots dropdown menu & note editing
+  const [openMicMenuId, setOpenMicMenuId] = useState<string | null>(null);
+  const [editingMicNoteId, setEditingMicNoteId] = useState<string | null>(null);
+  const [tempMicNote, setTempMicNote] = useState("");
+  const micMenuRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    function handleClickOutsideMic(event: MouseEvent) {
+      if (micMenuRef.current && !micMenuRef.current.contains(event.target as Node)) {
+        setOpenMicMenuId(null);
+      }
+    }
+    if (openMicMenuId) {
+      document.addEventListener("mousedown", handleClickOutsideMic);
+    }
+    return () => {
+      document.removeEventListener("mousedown", handleClickOutsideMic);
+    };
+  }, [openMicMenuId]);
+
+  // Collapsible accordion states for packed layout
+  const [isTargetsOpen, setIsTargetsOpen] = useState(true);
+  const [isNotesOpen, setIsNotesOpen] = useState(false);
+
+  // Phase Targets inline state
+  const [isAddingTarget, setIsAddingTarget] = useState(false);
+  const [newTargetExercise, setNewTargetExercise] = useState("");
+  const [newTargetWeight, setNewTargetWeight] = useState("");
+  const [newTargetReps, setNewTargetReps] = useState("");
+  const [newTargetText, setNewTargetText] = useState("");
+
+  // Phase Notes inline state
+  const [isEditingInlineNotes, setIsEditingInlineNotes] = useState(false);
+  const [tempInlineNotes, setTempInlineNotes] = useState("");
+
+  // Modal edit state for Targets and Notes
+  const [editTargets, setEditTargets] = useState<PhaseTarget[]>([]);
+  const [editNotes, setEditNotes] = useState("");
+  const [modalNewExercise, setModalNewExercise] = useState("");
+  const [modalNewTarget, setModalNewTarget] = useState("");
+
   // Metrics for active phase
   let totalPhaseWorkouts = 0;
   let totalPhaseVolume = 0;
@@ -254,6 +342,10 @@ export const PeriodisationSettingsView: React.FC<PeriodisationSettingsViewProps>
     setEditPhaseKey(activeMeso.phaseKey);
     setEditStart(activeMeso.start);
     setEditMacroId(activeMeso.macroId);
+    setEditTargets(activeMeso.targets ? [...activeMeso.targets] : []);
+    setEditNotes(activeMeso.notes || "");
+    setModalNewExercise("");
+    setModalNewTarget("");
     setIsEditingActiveMeso(true);
   };
 
@@ -264,8 +356,109 @@ export const PeriodisationSettingsView: React.FC<PeriodisationSettingsViewProps>
       phaseKey: editPhaseKey,
       start: editStart,
       macroId: editMacroId,
+      targets: editTargets,
+      notes: editNotes.trim(),
     });
     setIsEditingActiveMeso(false);
+  };
+
+  const handleAddInlineTarget = () => {
+    if (!activeMeso) return;
+    const exercise = newTargetExercise.trim();
+    let target = newTargetText.trim();
+    if (!target && (newTargetWeight.trim() || newTargetReps.trim())) {
+      const parts: string[] = [];
+      if (newTargetWeight.trim()) parts.push(`${newTargetWeight.trim()} kg`);
+      if (newTargetReps.trim()) parts.push(`${newTargetReps.trim()} reps`);
+      target = parts.join(" × ");
+    }
+    if (!exercise || !target) return;
+
+    const newTargetItem: PhaseTarget = {
+      id: `target-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+      exercise,
+      target,
+      weight: newTargetWeight.trim() || undefined,
+      reps: newTargetReps.trim() || undefined,
+      completed: false,
+    };
+
+    const currentTargets = activeMeso.targets || [];
+    onUpdateMeso(activeMeso.id, {
+      name: activeMeso.name,
+      phaseKey: activeMeso.phaseKey,
+      start: activeMeso.start,
+      macroId: activeMeso.macroId,
+      targets: [...currentTargets, newTargetItem],
+      notes: activeMeso.notes,
+    });
+
+    setNewTargetExercise("");
+    setNewTargetWeight("");
+    setNewTargetReps("");
+    setNewTargetText("");
+    setIsAddingTarget(false);
+  };
+
+  const handleToggleTarget = (targetId: string) => {
+    if (!activeMeso) return;
+    const currentTargets = activeMeso.targets || [];
+    let justCompleted = false;
+    const updated = currentTargets.map((t) => {
+      if (t.id === targetId) {
+        if (!t.completed) justCompleted = true;
+        return { ...t, completed: !t.completed };
+      }
+      return t;
+    });
+
+    if (justCompleted) {
+      try {
+        confetti({
+          particleCount: 45,
+          spread: 70,
+          origin: { y: 0.65 },
+        });
+      } catch (err) {
+        // fallback
+      }
+    }
+
+    onUpdateMeso(activeMeso.id, {
+      name: activeMeso.name,
+      phaseKey: activeMeso.phaseKey,
+      start: activeMeso.start,
+      macroId: activeMeso.macroId,
+      targets: updated,
+      notes: activeMeso.notes,
+    });
+  };
+
+  const handleDeleteTarget = (targetId: string) => {
+    if (!activeMeso) return;
+    const currentTargets = activeMeso.targets || [];
+    const updated = currentTargets.filter((t) => t.id !== targetId);
+    onUpdateMeso(activeMeso.id, {
+      name: activeMeso.name,
+      phaseKey: activeMeso.phaseKey,
+      start: activeMeso.start,
+      macroId: activeMeso.macroId,
+      targets: updated,
+      notes: activeMeso.notes,
+    });
+  };
+
+  const handleSaveInlineNotes = () => {
+    if (!activeMeso) return;
+    onUpdateMeso(activeMeso.id, {
+      name: activeMeso.name,
+      phaseKey: activeMeso.phaseKey,
+      start: activeMeso.start,
+      macroId: activeMeso.macroId,
+      targets: activeMeso.targets || [],
+      notes: tempInlineNotes.trim(),
+    });
+    setIsEditingInlineNotes(false);
   };
 
   const handleAddInlineMicrocycle = () => {
@@ -313,6 +506,18 @@ export const PeriodisationSettingsView: React.FC<PeriodisationSettingsViewProps>
           padding: 18px 16px 100px;
           font-family: 'Inter', sans-serif;
           color: #edeae2;
+          box-sizing: border-box;
+          overflow-x: hidden;
+          width: 100%;
+        }
+
+        .tab-text-short { display: none; }
+        @media (max-width: 540px) {
+          .tab-text-full { display: none; }
+          .tab-text-short { display: inline; }
+          .periodisation-settings-container {
+            padding: 12px 10px 90px;
+          }
         }
 
         /* Top Action Header */
@@ -414,6 +619,410 @@ export const PeriodisationSettingsView: React.FC<PeriodisationSettingsViewProps>
           justify-content: space-between;
           gap: 16px;
           flex-wrap: wrap;
+          padding-right: 38px;
+        }
+
+        .phase-more-menu-container {
+          position: absolute;
+          top: 18px;
+          right: 18px;
+          z-index: 25;
+        }
+
+        .phase-more-menu-btn {
+          width: 32px;
+          height: 32px;
+          border-radius: 8px;
+          background: rgba(255, 255, 255, 0.05);
+          border: 1px solid rgba(255, 255, 255, 0.1);
+          color: #94a3b8;
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          cursor: pointer;
+          transition: all 0.2s ease;
+        }
+
+        .phase-more-menu-btn:hover {
+          background: rgba(255, 255, 255, 0.12);
+          color: #ffffff;
+          border-color: rgba(255, 255, 255, 0.2);
+        }
+
+        .phase-actions-dropdown {
+          position: absolute;
+          top: calc(100% + 6px);
+          right: 0;
+          min-width: 155px;
+          background: #1e2433;
+          border: 1px solid #334155;
+          border-radius: 10px;
+          padding: 6px;
+          box-shadow: 0 10px 30px rgba(0, 0, 0, 0.6);
+          z-index: 50;
+          display: flex;
+          flex-direction: column;
+          gap: 4px;
+          animation: phaseFadeIn 0.15s ease-out;
+        }
+
+        @keyframes phaseFadeIn {
+          from { opacity: 0; transform: translateY(-4px); }
+          to { opacity: 1; transform: translateY(0); }
+        }
+
+        .phase-dropdown-item {
+          display: flex;
+          align-items: center;
+          gap: 8px;
+          padding: 8px 12px;
+          border-radius: 6px;
+          background: transparent;
+          border: none;
+          color: #e2e8f0;
+          font-size: 13px;
+          font-weight: 500;
+          cursor: pointer;
+          text-align: left;
+          transition: background 0.15s;
+          width: 100%;
+        }
+
+        .phase-dropdown-item:hover {
+          background: rgba(255, 255, 255, 0.08);
+          color: #ffffff;
+        }
+
+        .phase-dropdown-item-danger {
+          color: #f87171;
+        }
+
+        .phase-dropdown-item-danger:hover {
+          background: rgba(239, 68, 68, 0.15);
+          color: #fca5a5;
+        }
+
+        /* Unified Packed & Collapsible Section for Targets and Notes */
+        .phase-unified-pack {
+          background: rgba(15, 23, 42, 0.65);
+          border: 1px solid rgba(51, 65, 85, 0.6);
+          border-radius: 12px;
+          margin-top: 14px;
+          overflow: hidden;
+        }
+
+        .phase-accordion-section {
+          transition: all 0.2s ease;
+        }
+
+        .phase-accordion-section + .phase-accordion-section {
+          border-top: 1px solid rgba(51, 65, 85, 0.45);
+        }
+
+        .phase-accordion-header {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          padding: 8px 12px;
+          cursor: pointer;
+          user-select: none;
+          background: transparent;
+          transition: background 0.15s ease;
+          gap: 8px;
+        }
+
+        .phase-accordion-header:hover {
+          background: rgba(255, 255, 255, 0.035);
+        }
+
+        .phase-accordion-title-wrap {
+          display: flex;
+          align-items: center;
+          gap: 7px;
+          min-width: 0;
+          flex: 1;
+        }
+
+        .phase-accordion-title {
+          font-size: 11.5px;
+          font-weight: 700;
+          color: #e2e8f0;
+          letter-spacing: 0.3px;
+          text-transform: uppercase;
+          white-space: nowrap;
+        }
+
+        .phase-target-count-badge {
+          font-size: 9.5px;
+          font-weight: 800;
+          padding: 1.5px 6px;
+          border-radius: 10px;
+          background: rgba(16, 185, 129, 0.15);
+          color: #34d399;
+          border: 1px solid rgba(16, 185, 129, 0.3);
+        }
+
+        .phase-accordion-actions {
+          display: flex;
+          align-items: center;
+          gap: 6px;
+          flex-shrink: 0;
+        }
+
+        .phase-accordion-body {
+          padding: 0 12px 10px;
+          animation: phaseAccordionExpand 0.15s ease-out;
+        }
+
+        @keyframes phaseAccordionExpand {
+          from { opacity: 0; transform: translateY(-4px); }
+          to { opacity: 1; transform: translateY(0); }
+        }
+
+        .phase-chevron {
+          color: #94a3b8;
+          transition: transform 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+          flex-shrink: 0;
+        }
+
+        .phase-chevron-open {
+          transform: rotate(180deg);
+        }
+
+        .phase-mini-action-btn {
+          background: rgba(255, 255, 255, 0.06);
+          border: 1px solid rgba(255, 255, 255, 0.12);
+          color: #cbd5e1;
+          font-size: 11px;
+          font-weight: 600;
+          padding: 2.5px 7px;
+          border-radius: 5px;
+          display: inline-flex;
+          align-items: center;
+          gap: 3px;
+          cursor: pointer;
+          transition: all 0.15s ease;
+        }
+
+        .phase-mini-action-btn:hover {
+          background: rgba(255, 255, 255, 0.12);
+          color: #ffffff;
+          border-color: rgba(255, 255, 255, 0.22);
+        }
+
+        .phase-notes-snippet {
+          font-size: 11px;
+          color: #94a3b8;
+          font-style: italic;
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+          max-width: 140px;
+        }
+
+        .phase-empty-badge {
+          font-size: 9.5px;
+          color: #64748b;
+          background: rgba(100, 116, 139, 0.15);
+          padding: 1px 5px;
+          border-radius: 4px;
+        }
+
+        .phase-targets-list {
+          display: flex;
+          flex-direction: column;
+          gap: 5px;
+        }
+
+        .phase-target-item {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: 8px;
+          background: rgba(30, 41, 59, 0.5);
+          border: 1px solid rgba(71, 85, 105, 0.45);
+          border-radius: 6px;
+          padding: 5px 8px;
+          transition: all 0.15s ease;
+        }
+
+        .phase-target-item:hover {
+          border-color: rgba(148, 163, 184, 0.4);
+          background: rgba(30, 41, 59, 0.8);
+        }
+
+        .phase-target-completed {
+          background: rgba(16, 185, 129, 0.08);
+          border-color: rgba(16, 185, 129, 0.3);
+        }
+
+        .phase-target-checkbox {
+          background: transparent;
+          border: none;
+          padding: 0;
+          cursor: pointer;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          flex-shrink: 0;
+        }
+
+        .phase-target-details {
+          display: flex;
+          align-items: center;
+          gap: 6px;
+          flex: 1;
+          min-width: 0;
+          overflow: hidden;
+          flex-wrap: wrap;
+        }
+
+        .phase-target-exercise {
+          font-size: 12px;
+          font-weight: 700;
+          color: #f1f5f9;
+          white-space: nowrap;
+          flex-shrink: 0;
+        }
+
+        .phase-target-completed .phase-target-exercise {
+          text-decoration: line-through;
+          color: #94a3b8;
+        }
+
+        .phase-target-badge {
+          display: inline-flex;
+          align-items: center;
+          padding: 1.5px 6px;
+          border-radius: 4px;
+          background: rgba(56, 189, 248, 0.12);
+          border: 1px solid rgba(56, 189, 248, 0.25);
+          color: #38bdf8;
+          font-size: 11px;
+          font-weight: 600;
+          word-break: break-word;
+        }
+
+        .phase-target-completed .phase-target-badge {
+          background: rgba(16, 185, 129, 0.12);
+          border-color: rgba(16, 185, 129, 0.3);
+          color: #34d399;
+        }
+
+        .phase-target-del-btn {
+          background: transparent;
+          border: none;
+          color: #64748b;
+          padding: 2px;
+          cursor: pointer;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          border-radius: 4px;
+          transition: color 0.15s;
+          flex-shrink: 0;
+        }
+
+        .phase-target-del-btn:hover {
+          color: #f87171;
+        }
+
+        .phase-empty-compact {
+          text-align: center;
+          padding: 8px 10px;
+          border-radius: 6px;
+          border: 1px dashed rgba(100, 116, 139, 0.3);
+          background: rgba(15, 23, 42, 0.25);
+          color: #94a3b8;
+          font-size: 11.5px;
+          cursor: pointer;
+          transition: all 0.15s;
+        }
+
+        .phase-empty-compact:hover {
+          border-color: rgba(148, 163, 184, 0.5);
+          color: #cbd5e1;
+        }
+
+        .phase-add-target-form, .phase-notes-edit-form {
+          display: flex;
+          flex-direction: column;
+          gap: 8px;
+          padding-top: 4px;
+        }
+
+        .phase-target-input-row {
+          display: flex;
+          gap: 6px;
+          flex-wrap: wrap;
+        }
+
+        .phase-field-label {
+          font-size: 10.5px;
+          font-weight: 600;
+          color: #94a3b8;
+          margin-bottom: 3px;
+          display: block;
+        }
+
+        .phase-quick-chips {
+          display: flex;
+          gap: 5px;
+          flex-wrap: wrap;
+        }
+
+        .phase-chip-btn {
+          background: rgba(255, 255, 255, 0.05);
+          border: 1px solid rgba(255, 255, 255, 0.1);
+          color: #cbd5e1;
+          font-size: 10.5px;
+          font-weight: 500;
+          padding: 2px 7px;
+          border-radius: 10px;
+          cursor: pointer;
+          transition: all 0.15s;
+        }
+
+        .phase-chip-btn:hover {
+          background: rgba(255, 255, 255, 0.12);
+          color: #ffffff;
+          border-color: rgba(255, 255, 255, 0.2);
+        }
+
+        .phase-target-form-actions {
+          display: flex;
+          justify-content: flex-end;
+          gap: 6px;
+          margin-top: 2px;
+        }
+
+        .phase-btn-sm {
+          padding: 4px 10px;
+          font-size: 11.5px;
+          border-radius: 5px;
+        }
+
+        .phase-notes-textarea {
+          font-family: inherit;
+          font-size: 12px;
+          line-height: 1.45;
+          resize: vertical;
+          min-height: 54px;
+        }
+
+        .phase-notes-display {
+          background: rgba(30, 41, 59, 0.35);
+          border-left: 3px solid #38bdf8;
+          border-radius: 0 6px 6px 0;
+          padding: 6px 10px;
+        }
+
+        .phase-notes-content {
+          margin: 0;
+          font-size: 12px;
+          line-height: 1.5;
+          color: #cbd5e1;
+          white-space: pre-wrap;
         }
 
         .phase-badge-pill {
@@ -553,6 +1162,240 @@ export const PeriodisationSettingsView: React.FC<PeriodisationSettingsViewProps>
           font-weight: 600;
           padding: 2px 8px;
           border-radius: 6px;
+        }
+
+        /* Microcycle 3-dots Menu */
+        .mc-more-menu-container {
+          position: relative;
+          display: inline-flex;
+          align-items: center;
+        }
+
+        .mc-more-menu-btn {
+          width: 28px;
+          height: 28px;
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          border-radius: 6px;
+          background: rgba(255, 255, 255, 0.05);
+          border: 1px solid rgba(255, 255, 255, 0.1);
+          color: #94a3b8;
+          cursor: pointer;
+          transition: all 0.15s ease;
+        }
+
+        .mc-more-menu-btn:hover {
+          background: rgba(255, 255, 255, 0.12);
+          color: #ffffff;
+          border-color: rgba(255, 255, 255, 0.22);
+        }
+
+        .mc-actions-dropdown {
+          position: absolute;
+          top: calc(100% + 5px);
+          right: 0;
+          min-width: 160px;
+          background: #1c2333;
+          border: 1px solid #334155;
+          border-radius: 8px;
+          padding: 5px;
+          box-shadow: 0 8px 24px rgba(0, 0, 0, 0.65);
+          z-index: 45;
+          display: flex;
+          flex-direction: column;
+          gap: 3px;
+          animation: phaseFadeIn 0.12s ease-out;
+        }
+
+        .mc-dropdown-item {
+          display: flex;
+          align-items: center;
+          gap: 8px;
+          padding: 6px 10px;
+          border-radius: 5px;
+          background: transparent;
+          border: none;
+          color: #cbd5e1;
+          font-size: 11.5px;
+          font-weight: 500;
+          cursor: pointer;
+          text-align: left;
+          transition: background 0.12s;
+          width: 100%;
+        }
+
+        .mc-dropdown-item:hover {
+          background: rgba(255, 255, 255, 0.08);
+          color: #ffffff;
+        }
+
+        .mc-dropdown-item-danger {
+          color: #f87171;
+        }
+
+        .mc-dropdown-item-danger:hover {
+          background: rgba(239, 68, 68, 0.15);
+          color: #fca5a5;
+        }
+
+        /* Microcycle Note Section */
+        .mc-note-banner {
+          background: rgba(30, 41, 59, 0.5);
+          border-left: 3px solid #38bdf8;
+          border-radius: 0 6px 6px 0;
+          padding: 5px 8px;
+          margin-bottom: 10px;
+          display: flex;
+          align-items: flex-start;
+          justify-content: space-between;
+          gap: 8px;
+          cursor: pointer;
+          transition: background 0.15s ease;
+        }
+
+        .mc-note-banner:hover {
+          background: rgba(30, 41, 59, 0.8);
+        }
+
+        .mc-note-banner-left {
+          display: flex;
+          align-items: flex-start;
+          gap: 6px;
+          flex: 1;
+          min-width: 0;
+        }
+
+        .mc-note-icon {
+          color: #38bdf8;
+          flex-shrink: 0;
+          margin-top: 1.5px;
+        }
+
+        .mc-note-text {
+          font-size: 11px;
+          line-height: 1.4;
+          color: #cbd5e1;
+          word-break: break-word;
+          white-space: pre-wrap;
+        }
+
+        .mc-note-edit-icon-btn {
+          background: transparent;
+          border: none;
+          color: #64748b;
+          cursor: pointer;
+          padding: 2px;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          border-radius: 4px;
+          transition: color 0.15s;
+          flex-shrink: 0;
+        }
+
+        .mc-note-edit-icon-btn:hover {
+          color: #38bdf8;
+        }
+
+        .mc-note-empty-trigger-wrap {
+          margin-bottom: 8px;
+          display: flex;
+        }
+
+        .mc-add-note-btn {
+          background: transparent;
+          border: 1px dashed rgba(100, 116, 139, 0.35);
+          color: #94a3b8;
+          font-size: 10.5px;
+          font-weight: 600;
+          padding: 2px 8px;
+          border-radius: 5px;
+          display: inline-flex;
+          align-items: center;
+          gap: 4px;
+          cursor: pointer;
+          transition: all 0.15s;
+        }
+
+        .mc-add-note-btn:hover {
+          border-color: rgba(56, 189, 248, 0.5);
+          color: #38bdf8;
+          background: rgba(56, 189, 248, 0.05);
+        }
+
+        .mc-note-edit-box {
+          background: #0f172a;
+          border: 1px solid #334155;
+          border-radius: 8px;
+          padding: 8px 10px;
+          margin-bottom: 10px;
+          display: flex;
+          flex-direction: column;
+          gap: 6px;
+        }
+
+        .mc-note-edit-header {
+          display: flex;
+          align-items: center;
+          gap: 5px;
+          font-size: 10.5px;
+          font-weight: 700;
+          color: #94a3b8;
+          text-transform: uppercase;
+          letter-spacing: 0.3px;
+        }
+
+        .mc-note-textarea {
+          background: #1e293b;
+          border: 1px solid #475569;
+          border-radius: 6px;
+          color: #ffffff;
+          font-size: 11.5px;
+          padding: 6px 8px;
+          resize: vertical;
+          min-height: 48px;
+          font-family: inherit;
+          outline: none;
+        }
+
+        .mc-note-textarea:focus {
+          border-color: #38bdf8;
+        }
+
+        .mc-note-actions {
+          display: flex;
+          justify-content: flex-end;
+          gap: 6px;
+        }
+
+        .mc-note-btn {
+          padding: 3px 8px;
+          font-size: 11px;
+          font-weight: 600;
+          border-radius: 5px;
+          cursor: pointer;
+          border: none;
+          transition: all 0.15s;
+        }
+
+        .mc-note-btn-cancel {
+          background: rgba(100, 116, 139, 0.2);
+          color: #cbd5e1;
+        }
+
+        .mc-note-btn-cancel:hover {
+          background: rgba(100, 116, 139, 0.35);
+          color: #ffffff;
+        }
+
+        .mc-note-btn-save {
+          background: #0284c7;
+          color: #ffffff;
+        }
+
+        .mc-note-btn-save:hover {
+          background: #0369a1;
         }
 
         /* Days Grid inside Microcycle */
@@ -807,32 +1650,88 @@ export const PeriodisationSettingsView: React.FC<PeriodisationSettingsViewProps>
             </div>
           </div>
 
-          {/* Interactive Contextual Action Buttons */}
-          <div className="settings-action-bar">
-            {/* When NO macrocycle is selected: ONLY Add Macrocycle */}
-            {selectionLevel === 'none' && (
+          {/* Sub-tab Switcher: Planner vs Analysis & Graphs */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap', width: '100%', justifyContent: 'space-between' }}>
+            <div style={{ display: 'flex', alignItems: 'center', background: '#0b0f17', border: '1px solid #232d40', borderRadius: '10px', padding: '2px', gap: '2px' }}>
               <button
                 type="button"
-                className="settings-action-btn settings-action-btn-primary"
-                onClick={onAddMacro}
-                title="Create a new annual / macro plan block"
+                onClick={() => setActiveSubTab('planner')}
+                style={{
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  gap: '5px',
+                  padding: '5px 11px',
+                  borderRadius: '7px',
+                  fontSize: '11.5px',
+                  fontWeight: 700,
+                  border: 'none',
+                  cursor: 'pointer',
+                  background: activeSubTab === 'planner' ? '#1e293b' : 'transparent',
+                  color: activeSubTab === 'planner' ? '#ffffff' : '#94a3b8',
+                  boxShadow: activeSubTab === 'planner' ? '0 2px 6px rgba(0,0,0,0.4)' : 'none',
+                  transition: 'all 0.15s ease',
+                  whiteSpace: 'nowrap',
+                }}
               >
-                <Plus className="w-4 h-4 text-white" />
-                <span>Add Macrocycle</span>
+                <Calendar size={12} style={{ color: activeSubTab === 'planner' ? '#38bdf8' : '#94a3b8' }} />
+                <span className="tab-text-full">Schedule & Planner</span>
+                <span className="tab-text-short">Planner</span>
               </button>
-            )}
+              <button
+                type="button"
+                onClick={() => setActiveSubTab('analytics')}
+                style={{
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  gap: '5px',
+                  padding: '5px 11px',
+                  borderRadius: '7px',
+                  fontSize: '11.5px',
+                  fontWeight: 700,
+                  border: 'none',
+                  cursor: 'pointer',
+                  background: activeSubTab === 'analytics' ? '#1e293b' : 'transparent',
+                  color: activeSubTab === 'analytics' ? '#ffffff' : '#94a3b8',
+                  boxShadow: activeSubTab === 'analytics' ? '0 2px 6px rgba(0,0,0,0.4)' : 'none',
+                  transition: 'all 0.15s ease',
+                  whiteSpace: 'nowrap',
+                }}
+              >
+                <TrendingUp size={12} style={{ color: activeSubTab === 'analytics' ? '#f43f5e' : '#94a3b8' }} />
+                <span className="tab-text-full">Analysis & Graphs</span>
+                <span className="tab-text-short">Graphs</span>
+              </button>
+            </div>
 
-            {/* When a macrocycle is selected: ONLY Add Mesocycle */}
-            {selectionLevel === 'macrocycle' && (
-              <button
-                type="button"
-                className="settings-action-btn settings-action-btn-primary"
-                onClick={() => onAddMeso(currentMacro?.id)}
-                title={`Add a new training phase / mesocycle to ${currentMacro?.name || 'Macrocycle'}`}
-              >
-                <Plus className="w-4 h-4 text-white" />
-                <span>Add Mesocycle</span>
-              </button>
+            {/* Interactive Contextual Action Buttons (only in planner mode) */}
+            {activeSubTab === 'planner' && (
+              <div className="settings-action-bar">
+                {/* When NO macrocycle is selected: ONLY Add Macrocycle */}
+                {selectionLevel === 'none' && (
+                  <button
+                    type="button"
+                    className="settings-action-btn settings-action-btn-primary"
+                    onClick={onAddMacro}
+                    title="Create a new annual / macro plan block"
+                  >
+                    <Plus className="w-4 h-4 text-white" />
+                    <span>Add Macrocycle</span>
+                  </button>
+                )}
+
+                {/* When a macrocycle is selected: ONLY Add Mesocycle */}
+                {selectionLevel === 'macrocycle' && (
+                  <button
+                    type="button"
+                    className="settings-action-btn settings-action-btn-primary"
+                    onClick={() => onAddMeso(currentMacro?.id)}
+                    title={`Add a new training phase / mesocycle to ${currentMacro?.name || 'Macrocycle'}`}
+                  >
+                    <Plus className="w-4 h-4 text-white" />
+                    <span>Add Mesocycle</span>
+                  </button>
+                )}
+              </div>
             )}
           </div>
         </div>
@@ -1444,8 +2343,31 @@ export const PeriodisationSettingsView: React.FC<PeriodisationSettingsViewProps>
         )}
       </div>
 
-      {/* 2. When selectionLevel === 'none': show Macrocycle Architecture */}
-      {selectionLevel === 'none' && (
+      {/* Body: Conditional Rendering between Periodisation Analysis vs Planner Schedule */}
+      {activeSubTab === 'analytics' ? (
+        <PeriodisationAnalysisView
+          macrocycles={macrocycles}
+          mesocycles={mesocycles}
+          today={today}
+          controlledLevel={selectionLevel === 'macrocycle' ? 'macrocycle' : 'mesocycle'}
+          selectedMacroId={currentMacro?.id || null}
+          selectedMesoId={selectionLevel === 'macrocycle' ? null : (activeMeso?.id || null)}
+          hideLevelBar={true}
+          hideScopeSelect={true}
+          onDayClick={onDayClick}
+          onSelectMeso={(mesoId) => {
+            setSelectedMesoId(mesoId);
+            setSelectionLevel('mesocycle');
+          }}
+          onSelectMacro={(macroId) => {
+            setSelectedMacroId(macroId);
+            setSelectionLevel('macrocycle');
+          }}
+        />
+      ) : (
+        <>
+          {/* 2. When selectionLevel === 'none': show Macrocycle Architecture */}
+          {selectionLevel === 'none' && (
         <div style={{ marginTop: "12px", marginBottom: "30px" }}>
           <div className="calendar-section-title">
             <Layers className="w-5 h-5 text-emerald-400" />
@@ -1619,6 +2541,50 @@ export const PeriodisationSettingsView: React.FC<PeriodisationSettingsViewProps>
             className="active-phase-card"
             style={{ "--phase-color": phaseInfo.color } as React.CSSProperties}
           >
+          {/* Top-right vertical dotted icon dropdown */}
+          <div className="phase-more-menu-container" ref={mesoMenuRef}>
+            <button
+              type="button"
+              className="phase-more-menu-btn"
+              onClick={(e) => {
+                e.stopPropagation();
+                setIsMesoMenuOpen(!isMesoMenuOpen);
+              }}
+              title="Phase Options"
+              aria-label="Phase Options"
+            >
+              <MoreVertical size={16} />
+            </button>
+            {isMesoMenuOpen && (
+              <div className="phase-actions-dropdown">
+                <button
+                  type="button"
+                  className="phase-dropdown-item"
+                  onClick={() => {
+                    setIsMesoMenuOpen(false);
+                    handleOpenEditMeso();
+                  }}
+                >
+                  <Pencil size={14} />
+                  <span>Edit Phase</span>
+                </button>
+                <button
+                  type="button"
+                  className="phase-dropdown-item phase-dropdown-item-danger"
+                  onClick={() => {
+                    setIsMesoMenuOpen(false);
+                    if (window.confirm(`Are you sure you want to delete "${activeMeso.name}"?`)) {
+                      onDeleteMeso(activeMeso.id);
+                    }
+                  }}
+                >
+                  <Trash2 size={14} />
+                  <span>Delete Phase</span>
+                </button>
+              </div>
+            )}
+          </div>
+
           <div className="phase-card-top-row">
             <div>
               <div className="phase-badge-pill">
@@ -1690,27 +2656,6 @@ export const PeriodisationSettingsView: React.FC<PeriodisationSettingsViewProps>
                 <Plus size={14} />
                 <span>Add Microcycle</span>
               </button>
-
-              <button
-                type="button"
-                className="action-icon-btn"
-                onClick={handleOpenEditMeso}
-                title="Edit Phase Metadata (Name, Phase Type, Dates)"
-              >
-                <Pencil size={13} />
-              </button>
-              <button
-                type="button"
-                className="action-icon-btn action-icon-btn-danger"
-                onClick={() => {
-                  if (window.confirm(`Are you sure you want to delete "${activeMeso.name}"?`)) {
-                    onDeleteMeso(activeMeso.id);
-                  }
-                }}
-                title="Delete Mesocycle"
-              >
-                <Trash2 size={13} />
-              </button>
             </div>
           </div>
 
@@ -1734,6 +2679,313 @@ export const PeriodisationSettingsView: React.FC<PeriodisationSettingsViewProps>
               </div>
               <div className="phase-stat-lbl">Phase Volume</div>
             </div>
+          </div>
+
+          {/* Unified Packed & Collapsible Section for Targets and Notes */}
+          <div className="phase-unified-pack">
+            {/* Section 1: Phase Targets */}
+            <div className="phase-accordion-section">
+              <div
+                className="phase-accordion-header"
+                onClick={() => setIsTargetsOpen(!isTargetsOpen)}
+              >
+                <div className="phase-accordion-title-wrap">
+                  <Target size={14} style={{ color: "#f59e0b" }} />
+                  <span className="phase-accordion-title">Phase Targets</span>
+                  {(activeMeso.targets || []).length > 0 && (
+                    <span className="phase-target-count-badge">
+                      {(activeMeso.targets || []).filter((t) => t.completed).length}/{(activeMeso.targets || []).length} Hit
+                    </span>
+                  )}
+                </div>
+
+                <div className="phase-accordion-actions">
+                  {!isAddingTarget && (
+                    <button
+                      type="button"
+                      className="phase-mini-action-btn"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setIsTargetsOpen(true);
+                        setIsAddingTarget(true);
+                      }}
+                      title="Add a lift target"
+                    >
+                      <Plus size={11} />
+                      <span>Target</span>
+                    </button>
+                  )}
+                  <ChevronDown
+                    size={15}
+                    className={`phase-chevron ${isTargetsOpen ? "phase-chevron-open" : ""}`}
+                  />
+                </div>
+              </div>
+
+              {isTargetsOpen && (
+                <div className="phase-accordion-body">
+                  {/* Target List */}
+                  {(activeMeso.targets || []).length > 0 ? (
+                    <div className="phase-targets-list">
+                      {(activeMeso.targets || []).map((tgt) => (
+                        <div
+                          key={tgt.id}
+                          className={`phase-target-item ${tgt.completed ? "phase-target-completed" : ""}`}
+                        >
+                          <button
+                            type="button"
+                            className="phase-target-checkbox"
+                            onClick={() => handleToggleTarget(tgt.id)}
+                            title={tgt.completed ? "Mark in progress" : "Mark achieved!"}
+                          >
+                            {tgt.completed ? (
+                              <CheckCircle2 size={15} style={{ color: "#34d399" }} />
+                            ) : (
+                              <Circle size={15} style={{ color: "#64748b" }} />
+                            )}
+                          </button>
+                          <div className="phase-target-details">
+                            <span className="phase-target-exercise">{tgt.exercise}:</span>
+                            <span className="phase-target-badge">{tgt.target}</span>
+                          </div>
+                          <button
+                            type="button"
+                            className="phase-target-del-btn"
+                            onClick={() => handleDeleteTarget(tgt.id)}
+                            title="Delete target"
+                          >
+                            <X size={12} />
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    !isAddingTarget && (
+                      <div
+                        className="phase-empty-compact"
+                        onClick={() => setIsAddingTarget(true)}
+                      >
+                        <span>+ Add Phase Lift Target (e.g. Bench Press 110kg × 7 reps)</span>
+                      </div>
+                    )
+                  )}
+
+                  {/* Inline Add Target Form */}
+                  {isAddingTarget && (
+                    <div className="phase-add-target-form">
+                      <div className="phase-target-input-row">
+                        <div style={{ flex: 1.4, minWidth: "120px" }}>
+                          <label className="phase-field-label">Exercise</label>
+                          <input
+                            className="text-input"
+                            value={newTargetExercise}
+                            onChange={(e) => setNewTargetExercise(e.target.value)}
+                            placeholder="e.g. Bench Press"
+                            list="target-exercise-suggestions"
+                            autoFocus
+                            style={{ padding: "6px 8px", fontSize: "12px" }}
+                          />
+                          <datalist id="target-exercise-suggestions">
+                            <option value="Bench Press" />
+                            <option value="Squat" />
+                            <option value="Deadlift" />
+                            <option value="Overhead Press" />
+                            <option value="Incline DB Press" />
+                            <option value="Barbell Row" />
+                          </datalist>
+                        </div>
+                        <div style={{ flex: 1, minWidth: "80px" }}>
+                          <label className="phase-field-label">Weight (kg)</label>
+                          <input
+                            className="text-input"
+                            value={newTargetWeight}
+                            onChange={(e) => setNewTargetWeight(e.target.value)}
+                            placeholder="e.g. 110"
+                            style={{ padding: "6px 8px", fontSize: "12px" }}
+                          />
+                        </div>
+                        <div style={{ flex: 1, minWidth: "80px" }}>
+                          <label className="phase-field-label">Reps / Goal</label>
+                          <input
+                            className="text-input"
+                            value={newTargetReps}
+                            onChange={(e) => setNewTargetReps(e.target.value)}
+                            placeholder="e.g. 7 reps"
+                            style={{ padding: "6px 8px", fontSize: "12px" }}
+                          />
+                        </div>
+                      </div>
+
+                      {/* Quick Chips */}
+                      <div className="phase-quick-chips">
+                        {["Bench Press", "Squat", "Deadlift", "OHP", "Incline Bench"].map((chip) => (
+                          <button
+                            key={chip}
+                            type="button"
+                            className="phase-chip-btn"
+                            onClick={() => setNewTargetExercise(chip)}
+                          >
+                            {chip}
+                          </button>
+                        ))}
+                      </div>
+
+                      <div className="phase-target-form-actions">
+                        <button
+                          type="button"
+                          className="btn-ghost phase-btn-sm"
+                          onClick={() => {
+                            setIsAddingTarget(false);
+                            setNewTargetExercise("");
+                            setNewTargetWeight("");
+                            setNewTargetReps("");
+                            setNewTargetText("");
+                          }}
+                        >
+                          Cancel
+                        </button>
+                        <button
+                          type="button"
+                          className="btn-primary phase-btn-sm"
+                          onClick={handleAddInlineTarget}
+                          disabled={!newTargetExercise.trim() || (!newTargetWeight.trim() && !newTargetReps.trim() && !newTargetText.trim())}
+                        >
+                          Save Target
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+
+            {/* Section 2: Phase Notes & Strategy */}
+            <div className="phase-accordion-section">
+              <div
+                className="phase-accordion-header"
+                onClick={() => setIsNotesOpen(!isNotesOpen)}
+              >
+                <div className="phase-accordion-title-wrap">
+                  <FileText size={14} style={{ color: "#38bdf8" }} />
+                  <span className="phase-accordion-title">Phase Notes</span>
+                  {activeMeso.notes ? (
+                    <span className="phase-notes-snippet" title={activeMeso.notes}>
+                      {activeMeso.notes}
+                    </span>
+                  ) : (
+                    <span className="phase-empty-badge">None</span>
+                  )}
+                </div>
+
+                <div className="phase-accordion-actions">
+                  {!isEditingInlineNotes && (
+                    <button
+                      type="button"
+                      className="phase-mini-action-btn"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setTempInlineNotes(activeMeso.notes || "");
+                        setIsNotesOpen(true);
+                        setIsEditingInlineNotes(true);
+                      }}
+                      title="Edit or add notes"
+                    >
+                      <Edit3 size={11} />
+                      <span>{activeMeso.notes ? "Edit" : "Add"}</span>
+                    </button>
+                  )}
+                  <ChevronDown
+                    size={15}
+                    className={`phase-chevron ${isNotesOpen ? "phase-chevron-open" : ""}`}
+                  />
+                </div>
+              </div>
+
+              {isNotesOpen && (
+                <div className="phase-accordion-body">
+                  {isEditingInlineNotes ? (
+                    <div className="phase-notes-edit-form">
+                      <textarea
+                        className="text-input phase-notes-textarea"
+                        value={tempInlineNotes}
+                        onChange={(e) => setTempInlineNotes(e.target.value)}
+                        placeholder="e.g. Focus on chest volume, progressive overload on bench press, prioritize 8 hours sleep..."
+                        rows={2}
+                        autoFocus
+                        style={{ padding: "8px 10px", fontSize: "12px", minHeight: "56px" }}
+                      />
+                      <div className="phase-target-form-actions">
+                        <button
+                          type="button"
+                          className="btn-ghost phase-btn-sm"
+                          onClick={() => setIsEditingInlineNotes(false)}
+                        >
+                          Cancel
+                        </button>
+                        <button
+                          type="button"
+                          className="btn-primary phase-btn-sm"
+                          onClick={handleSaveInlineNotes}
+                        >
+                          Save Notes
+                        </button>
+                      </div>
+                    </div>
+                  ) : activeMeso.notes ? (
+                    <div
+                      className="phase-notes-display"
+                      onClick={() => {
+                        setTempInlineNotes(activeMeso.notes || "");
+                        setIsEditingInlineNotes(true);
+                      }}
+                      style={{ cursor: "pointer", padding: "8px 12px" }}
+                      title="Click to edit notes"
+                    >
+                      <p className="phase-notes-content" style={{ fontSize: "12px" }}>{activeMeso.notes}</p>
+                    </div>
+                  ) : (
+                    <div
+                      className="phase-empty-compact"
+                      onClick={() => {
+                        setTempInlineNotes("");
+                        setIsEditingInlineNotes(true);
+                      }}
+                    >
+                      <span>+ Add phase notes, goals, or training strategy...</span>
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          </div>
+
+          <div style={{ display: "flex", justifyContent: "flex-end", marginTop: "10px" }}>
+            <button
+              type="button"
+              onClick={() => setActiveSubTab('analytics')}
+              style={{
+                background: "rgba(56, 189, 248, 0.12)",
+                border: "1px solid rgba(56, 189, 248, 0.3)",
+                color: "#38bdf8",
+                fontSize: "11px",
+                fontWeight: 700,
+                padding: "5px 11px",
+                borderRadius: "8px",
+                cursor: "pointer",
+                display: "inline-flex",
+                alignItems: "center",
+                gap: "5px",
+                maxWidth: "100%",
+                boxSizing: "border-box",
+                overflow: "hidden",
+                textOverflow: "ellipsis",
+                whiteSpace: "nowrap",
+                transition: "all 0.15s ease",
+              }}
+            >
+              <TrendingUp size={13} className="flex-shrink-0" />
+              <span>View Graphs & Analysis →</span>
+            </button>
           </div>
         </div>
 
@@ -1792,32 +3044,151 @@ export const PeriodisationSettingsView: React.FC<PeriodisationSettingsViewProps>
                       )}
                     </div>
 
-                    <div style={{ display: "flex", alignItems: "center", gap: "4px" }}>
+                    <div className="mc-more-menu-container" ref={openMicMenuId === mic.id ? micMenuRef : null}>
                       <button
                         type="button"
-                        className="action-icon-btn"
-                        onClick={() => {
-                          setEditingLabelMicId(mic.id);
-                          setTempLabel(mic.label || "");
+                        className="mc-more-menu-btn"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setOpenMicMenuId(openMicMenuId === mic.id ? null : mic.id);
                         }}
-                        title="Rename week tag (e.g. Deload, Accumulation)"
+                        title="Microcycle Options"
+                        aria-label="Microcycle Options"
                       >
-                        <Pencil size={11} />
+                        <MoreVertical size={14} />
                       </button>
-                      <button
-                        type="button"
-                        className="action-icon-btn action-icon-btn-danger"
-                        onClick={() => {
-                          if (window.confirm(`Delete Microcycle ${mic.index}?`)) {
-                            onDeleteMicrocycle(activeMeso.id, mic.id);
-                          }
-                        }}
-                        title="Delete Microcycle"
-                      >
-                        <Trash2 size={11} />
-                      </button>
+
+                      {openMicMenuId === mic.id && (
+                        <div className="mc-actions-dropdown">
+                          <button
+                            type="button"
+                            className="mc-dropdown-item"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setOpenMicMenuId(null);
+                              setEditingLabelMicId(mic.id);
+                              setTempLabel(mic.label || "");
+                            }}
+                          >
+                            <Pencil size={12} />
+                            <span>Rename / Tag Week</span>
+                          </button>
+
+                          <button
+                            type="button"
+                            className="mc-dropdown-item"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setOpenMicMenuId(null);
+                              setEditingMicNoteId(mic.id);
+                              setTempMicNote(mic.note || "");
+                            }}
+                          >
+                            <FileText size={12} />
+                            <span>{mic.note ? "Edit Microcycle Note" : "Add Microcycle Note"}</span>
+                          </button>
+
+                          <button
+                            type="button"
+                            className="mc-dropdown-item mc-dropdown-item-danger"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setOpenMicMenuId(null);
+                              if (window.confirm(`Delete Microcycle ${mic.index}?`)) {
+                                onDeleteMicrocycle(activeMeso.id, mic.id);
+                              }
+                            }}
+                          >
+                            <Trash2 size={12} />
+                            <span>Delete Microcycle</span>
+                          </button>
+                        </div>
+                      )}
                     </div>
                   </div>
+
+                  {/* Microcycle Note Section */}
+                  {editingMicNoteId === mic.id ? (
+                    <div className="mc-note-edit-box">
+                      <div className="mc-note-edit-header">
+                        <FileText size={12} className="text-sky-400" />
+                        <span>Microcycle {mic.index} Note</span>
+                      </div>
+                      <textarea
+                        value={tempMicNote}
+                        onChange={(e) => setTempMicNote(e.target.value)}
+                        placeholder="e.g. Deload week, focus on paused bench, RPE 7-8 target, shoulder rehab..."
+                        className="mc-note-textarea"
+                        rows={2}
+                        autoFocus
+                      />
+                      <div className="mc-note-actions">
+                        <button
+                          type="button"
+                          className="mc-note-btn mc-note-btn-cancel"
+                          onClick={() => {
+                            setEditingMicNoteId(null);
+                            setTempMicNote("");
+                          }}
+                        >
+                          Cancel
+                        </button>
+                        <button
+                          type="button"
+                          className="mc-note-btn mc-note-btn-save"
+                          onClick={() => {
+                            if (onUpdateMicrocycleNote && activeMeso) {
+                              onUpdateMicrocycleNote(activeMeso.id, mic.id, tempMicNote.trim());
+                            }
+                            setEditingMicNoteId(null);
+                          }}
+                        >
+                          Save Note
+                        </button>
+                      </div>
+                    </div>
+                  ) : mic.note && mic.note.trim() ? (
+                    <div
+                      className="mc-note-banner"
+                      onClick={() => {
+                        setEditingMicNoteId(mic.id);
+                        setTempMicNote(mic.note || "");
+                      }}
+                      title="Click to edit microcycle note"
+                    >
+                      <div className="mc-note-banner-left">
+                        <FileText size={12} className="mc-note-icon" />
+                        <span className="mc-note-text">{mic.note}</span>
+                      </div>
+                      <button
+                        type="button"
+                        className="mc-note-edit-icon-btn"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setEditingMicNoteId(mic.id);
+                          setTempMicNote(mic.note || "");
+                        }}
+                        title="Edit note"
+                      >
+                        <Edit3 size={11} />
+                      </button>
+                    </div>
+                  ) : (
+                    <div className="mc-note-empty-trigger-wrap">
+                      <button
+                        type="button"
+                        className="mc-add-note-btn"
+                        onClick={() => {
+                          setEditingMicNoteId(mic.id);
+                          setTempMicNote("");
+                        }}
+                        title="Add note to this microcycle"
+                      >
+                        <Plus size={10} />
+                        <span>Add Note</span>
+                      </button>
+                    </div>
+                  )}
 
                   {/* Days in Microcycle */}
                   <div className="days-grid-list">
@@ -1983,6 +3354,8 @@ export const PeriodisationSettingsView: React.FC<PeriodisationSettingsViewProps>
         </div>
         </>
       )}
+      </>
+      )}
 
       {/* Edit Active Mesocycle Modal */}
       {isEditingActiveMeso && activeMeso && (
@@ -2046,6 +3419,97 @@ export const PeriodisationSettingsView: React.FC<PeriodisationSettingsViewProps>
                   </div>
                 </div>
               )}
+
+              {/* Phase Targets Section in Modal */}
+              <div className="field-row">
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "6px" }}>
+                  <label className="field-label" style={{ margin: 0 }}>Phase Targets</label>
+                  <span style={{ fontSize: "11px", color: "#94a3b8" }}>{editTargets.length} configured</span>
+                </div>
+                {editTargets.length > 0 && (
+                  <div style={{ display: "flex", flexDirection: "column", gap: "6px", marginBottom: "8px" }}>
+                    {editTargets.map((tgt, idx) => (
+                      <div
+                        key={tgt.id || idx}
+                        style={{
+                          display: "flex",
+                          alignItems: "center",
+                          justifyContent: "space-between",
+                          background: "rgba(255, 255, 255, 0.04)",
+                          border: "1px solid #334155",
+                          borderRadius: "8px",
+                          padding: "6px 10px",
+                        }}
+                      >
+                        <div style={{ display: "flex", alignItems: "center", gap: "8px", overflow: "hidden" }}>
+                          <span style={{ fontWeight: 600, color: "#f8fafc", fontSize: "13px" }}>{tgt.exercise}:</span>
+                          <span style={{ color: "#38bdf8", fontSize: "12.5px" }}>{tgt.target}</span>
+                        </div>
+                        <button
+                          type="button"
+                          className="action-icon-btn action-icon-btn-danger"
+                          style={{ width: "24px", height: "24px", padding: 0 }}
+                          onClick={() => setEditTargets(editTargets.filter((_, i) => i !== idx))}
+                          title="Remove target"
+                        >
+                          <X size={12} />
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+                <div style={{ display: "flex", gap: "6px" }}>
+                  <input
+                    className="text-input"
+                    style={{ flex: 1.2 }}
+                    value={modalNewExercise}
+                    onChange={(e) => setModalNewExercise(e.target.value)}
+                    placeholder="Lift (e.g. Bench Press)"
+                  />
+                  <input
+                    className="text-input"
+                    style={{ flex: 1 }}
+                    value={modalNewTarget}
+                    onChange={(e) => setModalNewTarget(e.target.value)}
+                    placeholder="Target (e.g. 110kg x 7)"
+                  />
+                  <button
+                    type="button"
+                    className="btn-ghost"
+                    style={{ fontSize: "12px", padding: "0 10px", whiteSpace: "nowrap" }}
+                    onClick={() => {
+                      if (!modalNewExercise.trim() || !modalNewTarget.trim()) return;
+                      setEditTargets([
+                        ...editTargets,
+                        {
+                          id: `tgt-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+                          exercise: modalNewExercise.trim(),
+                          target: modalNewTarget.trim(),
+                          completed: false,
+                        },
+                      ]);
+                      setModalNewExercise("");
+                      setModalNewTarget("");
+                    }}
+                    disabled={!modalNewExercise.trim() || !modalNewTarget.trim()}
+                  >
+                    + Add
+                  </button>
+                </div>
+              </div>
+
+              {/* Phase Notes Section in Modal */}
+              <div className="field-row">
+                <label className="field-label">Phase Notes & Strategy</label>
+                <textarea
+                  className="text-input"
+                  rows={3}
+                  value={editNotes}
+                  onChange={(e) => setEditNotes(e.target.value)}
+                  placeholder="e.g. Focus on chest volume, progressive overload on bench press, keep RPE 8-9..."
+                  style={{ resize: "vertical", minHeight: "70px", fontFamily: "inherit" }}
+                />
+              </div>
             </div>
 
             <div className="modal-footer">

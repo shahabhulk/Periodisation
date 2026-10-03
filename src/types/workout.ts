@@ -13,6 +13,15 @@ export interface WorkoutEntry {
 
 export type PhaseType = 'Hypertrophy' | 'Strength' | 'Peaking' | 'Accumulation' | 'Deload' | 'Taper' | 'Recovery';
 
+export interface PhaseTarget {
+  id: string;
+  exercise: string;
+  target: string;
+  weight?: string | number;
+  reps?: string | number;
+  completed?: boolean;
+}
+
 export interface MesocycleGroup {
   name: string;
   number: number;
@@ -43,3 +52,14 @@ export interface DisciplineTask {
   description: string;
   completed: boolean;
 }
+
+export interface PREntry {
+  id: string;
+  lift: string;
+  weight: number;
+  unit: string;
+  reps: number;
+  date: string;
+  note?: string;
+}
+

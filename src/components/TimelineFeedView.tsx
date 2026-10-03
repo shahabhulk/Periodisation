@@ -1,6 +1,7 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { Trophy, Dumbbell, Calendar, ChevronDown, ChevronRight, Clock, MoreVertical, Pencil, RotateCcw, Share2, Star, Trash2 } from 'lucide-react';
 import { ExerciseIllustration } from './ExerciseIllustration';
+import { formatDateDMY, isCardioExercise } from '../utils/workoutUtils';
 
 const PHASES: Record<string, { color: string; label: string }> = {
   Hypertrophy: { color: "#f59e0b", label: "Hypertrophy Phase" },
@@ -14,13 +15,9 @@ const PHASES: Record<string, { color: string; label: string }> = {
 function formatDateCustom(dateStr: string) {
   if (!dateStr) return '';
   const d = new Date(dateStr + "T00:00:00Z");
-  if (isNaN(d.getTime())) return dateStr;
-  const weekday = d.toLocaleDateString("en-US", { weekday: "short", timeZone: "UTC" });
-  const day = d.getUTCDate();
-  const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
-  const month = months[d.getUTCMonth()];
-  const year = d.getUTCFullYear();
-  return `${weekday}, ${day} ${month} ${year}`;
+  if (isNaN(d.getTime())) return formatDateDMY(dateStr);
+  const weekday = d.toLocaleDateString("en-GB", { weekday: "short", timeZone: "UTC" });
+  return `${weekday}, ${formatDateDMY(dateStr)}`;
 }
 
 function todayStr() {
@@ -35,6 +32,8 @@ interface SetEntry {
   type: string;
   weight: string | number;
   reps: string | number;
+  calories?: string | number;
+  minutes?: string | number;
   isPR: boolean;
   equipment?: 'raw' | 'gear';
 }
@@ -45,6 +44,9 @@ interface LiftEntry {
   gifUrl?: string;
   unit: string;
   sets: SetEntry[];
+  isCardio?: boolean;
+  e1rm?: string | number;
+  laterality?: 'bi' | 'uni';
 }
 
 export interface DayEntry {
@@ -63,6 +65,7 @@ export interface Microcycle {
   index: number;
   label: string | null;
   days: DayEntry[];
+  note?: string;
 }
 
 export interface Mesocycle {
@@ -76,6 +79,8 @@ export interface Mesocycle {
   end: string;
   status: string;
   microcycles: Microcycle[];
+  targets?: any[];
+  notes?: string;
 }
 
 interface TimelineFeedViewProps {
@@ -85,6 +90,7 @@ interface TimelineFeedViewProps {
   onDayClick: (mesoId: string, micId: string, day: DayEntry, initialEditMode?: boolean) => void;
   onDeleteDay?: (dayId: string) => void;
   onPerformAgain?: (day: DayEntry) => void;
+  onOpenExerciseHistory?: (name: string, gifUrl?: string) => void;
 }
 
 export const TimelineFeedView: React.FC<TimelineFeedViewProps> = ({
@@ -94,6 +100,7 @@ export const TimelineFeedView: React.FC<TimelineFeedViewProps> = ({
   onDayClick,
   onDeleteDay,
   onPerformAgain,
+  onOpenExerciseHistory,
 }) => {
   const [selectedMesoDropdown, setSelectedMesoDropdown] = useState(false);
   const [expandedMcs, setExpandedMcs] = useState<Record<string, boolean>>({});
@@ -213,6 +220,7 @@ export const TimelineFeedView: React.FC<TimelineFeedViewProps> = ({
       if (isWorkoutSession(day) && day.lifts && day.lifts.length > 0) {
         totalWorkoutsLogged++;
         day.lifts.forEach((lift) => {
+          if (isCardioExercise(lift)) return;
           (lift.sets || []).forEach((set) => {
             const w = parseFloat(String(set.weight)) || 0;
             const r = parseFloat(String(set.reps)) || 0;
@@ -964,9 +972,18 @@ export const TimelineFeedView: React.FC<TimelineFeedViewProps> = ({
                       <div className="lifts-thumb-flex">
                         {day.lifts.map((lift) => {
                           const sets = Array.isArray(lift.sets) ? lift.sets : [];
+                          const cardio = isCardioExercise(lift);
                           const topSet = sets.reduce((max, s) => {
                             const w = parseFloat(String(s.weight)) || 0;
                             return w > max ? w : max;
+                          }, 0);
+                          const topCal = sets.reduce((max, s) => {
+                            const c = parseFloat(String(s.calories !== undefined && s.calories !== "" ? s.calories : s.weight)) || 0;
+                            return c > max ? c : max;
+                          }, 0);
+                          const totalMins = sets.reduce((sum, s) => {
+                            const m = parseFloat(String(s.minutes !== undefined && s.minutes !== "" ? s.minutes : s.reps)) || 0;
+                            return sum + m;
                           }, 0);
 
                           return (
@@ -975,15 +992,23 @@ export const TimelineFeedView: React.FC<TimelineFeedViewProps> = ({
                               className="lift-mini-chip"
                               onClick={(e) => {
                                 e.stopPropagation();
-                                onDayClick(activeMeso.id, currentActiveMc!.id, day, false);
+                                if (onOpenExerciseHistory) {
+                                  onOpenExerciseHistory(lift.name, lift.gifUrl);
+                                } else {
+                                  onDayClick(activeMeso.id, currentActiveMc!.id, day, false);
+                                }
                               }}
                             >
                               <div className="lift-icon-box">
                                 <ExerciseIllustration name={lift.name} gifUrl={lift.gifUrl} className="w-full h-full" />
                               </div>
                               <span className="lift-chip-name" title={lift.name}>{lift.name}</span>
-                              <span className="lift-chip-badge">
-                                {sets.length} {sets.length === 1 ? 'set' : 'sets'} {topSet > 0 ? `· ${topSet}kg` : ''}
+                              <span className="lift-chip-badge" style={cardio ? { color: '#fb923c', borderColor: 'rgba(249,115,22,0.3)', background: 'rgba(249,115,22,0.1)' } : undefined}>
+                                {cardio ? (
+                                  `${sets.length} ${sets.length === 1 ? 'interval' : 'intervals'}${topCal > 0 ? ` · ${topCal} kcal` : totalMins > 0 ? ` · ${totalMins}m` : ' · Cardio'}`
+                                ) : (
+                                  `${sets.length} ${sets.length === 1 ? 'set' : 'sets'}${topSet > 0 ? ` · ${topSet}kg` : ''}${lift.e1rm ? ` (1RM ${lift.e1rm})` : ''}`
+                                )}
                               </span>
                             </div>
                           );

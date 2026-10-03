@@ -1,14 +1,16 @@
 import React, { useState, useEffect, useRef, useMemo } from "react";
-import { Pencil, Trash2, MoreVertical, RotateCcw, Share2, Star, BatteryCharging, AlertCircle, Timer, Dumbbell, Layers } from "lucide-react";
+import { Pencil, Trash2, MoreVertical, RotateCcw, Share2, Star, BatteryCharging, AlertCircle, Timer, Dumbbell, Layers, Flame, ChevronRight, Target, Sparkles } from "lucide-react";
 import { SidebarNav, NavHeaderButton, type TabType } from "./components/SidebarNav";
 import { ExerciseKanbanView } from "./components/ExerciseKanbanView";
 import { ProfileView } from "./components/ProfileView";
 import { TimelineFeedView } from "./components/TimelineFeedView";
+import { ExerciseHistoryModal } from "./components/ExerciseHistoryModal";
 import { PeriodisationSettingsView } from "./components/PeriodisationSettingsView";
 import { Analytics } from "./components/Analytics";
 import { INITIAL_WORKOUT_DATA } from "./data/initialWorkoutData";
-import type { WorkoutEntry } from "./types/workout";
+import type { WorkoutEntry, PhaseTarget } from "./types/workout";
 import { fetchLyftaExercises } from "./services/lyftaApi";
+import { formatDateDMY, isCardioExercise, calcE1RM, calcRepsFromE1RM, calcWeightFromE1RM } from "./utils/workoutUtils";
 
 /* ============================================================
    IRON LEDGER — powerlifting periodisation tracker
@@ -55,12 +57,14 @@ function addDays(dateStr: string, n: number) {
   return d.toISOString().slice(0, 10);
 }
 function fmtDateFull(dateStr: string) {
+  if (!dateStr) return "";
   const d = new Date(dateStr + "T00:00:00Z");
-  return d.toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric", year: "numeric", timeZone: "UTC" });
+  if (isNaN(d.getTime())) return formatDateDMY(dateStr);
+  const weekday = d.toLocaleDateString("en-GB", { weekday: "long", timeZone: "UTC" });
+  return `${weekday}, ${formatDateDMY(dateStr)}`;
 }
 function fmtDateShort(dateStr: string) {
-  const d = new Date(dateStr + "T00:00:00Z");
-  return d.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "2-digit", timeZone: "UTC" });
+  return formatDateDMY(dateStr);
 }
 function todayStr() {
   const d = new Date();
@@ -76,6 +80,8 @@ interface SetEntry {
   type: string; // "W" or "1", "2", "3" etc.
   weight: string | number;
   reps: string | number;
+  calories?: string | number;
+  minutes?: string | number;
   isPR: boolean;
   equipment?: 'raw' | 'gear';
 }
@@ -84,8 +90,11 @@ interface LiftEntry {
   id: string;
   name: string;
   gifUrl?: string;
-  unit: string; // e.g. "kg"
+  unit: string; // e.g. "kg" or "kcal"
   sets: SetEntry[];
+  isCardio?: boolean;
+  e1rm?: string | number;
+  laterality?: 'bi' | 'uni';
 }
 
 interface DayEntry {
@@ -104,6 +113,7 @@ interface Microcycle {
   index: number;
   label: string | null;
   days: DayEntry[];
+  note?: string;
 }
 
 interface Mesocycle {
@@ -117,6 +127,8 @@ interface Mesocycle {
   end: string;
   status: string;
   microcycles: Microcycle[];
+  targets?: PhaseTarget[];
+  notes?: string;
 }
 
 interface Macrocycle {
@@ -403,18 +415,24 @@ interface SwipeableSetRowProps {
   s: SetEntry;
   unit: string;
   listSetsLength: number;
+  isCardio?: boolean;
   onOpenTypeModal: (id: string) => void;
   updateSet: (id: string, patch: Partial<SetEntry>) => void;
   removeSet: (id: string) => void;
+  e1rm?: string | number;
+  laterality?: 'bi' | 'uni';
 }
 
 function SwipeableSetRow({
   s,
   unit,
   listSetsLength,
+  isCardio = false,
   onOpenTypeModal,
   updateSet,
   removeSet,
+  e1rm,
+  laterality = 'bi',
 }: SwipeableSetRowProps) {
   const [offsetX, setOffsetX] = useState(0);
   const [isSwiping, setIsSwiping] = useState(false);
@@ -473,6 +491,73 @@ function SwipeableSetRow({
     setIsDeleting(true);
     setOffsetX(-400);
     setTimeout(() => removeSet(s.id), 200);
+  };
+
+  const handleWeightChange = (newVal: string) => {
+    const patch: Partial<SetEntry> = { weight: newVal };
+    if (e1rm && !isCardio) {
+      const e1rmNum = parseFloat(String(e1rm));
+      const wNum = parseFloat(newVal);
+      if (e1rmNum > 0 && wNum > 0) {
+        if (wNum >= e1rmNum) {
+          patch.reps = 1;
+        } else {
+          const computed = calcRepsFromE1RM(e1rmNum, wNum, laterality);
+          // Avoid transient numbers when typing e.g. "1" or "10" towards "100"
+          if (computed >= 1 && computed <= 45) {
+            patch.reps = computed;
+          }
+        }
+      }
+    }
+    updateSet(s.id, patch);
+  };
+
+  const handleWeightBlur = () => {
+    if (e1rm && !isCardio) {
+      const e1rmNum = parseFloat(String(e1rm));
+      const wNum = parseFloat(String(s.weight));
+      if (e1rmNum > 0 && wNum > 0) {
+        if (!s.reps || String(s.reps).trim() === "") {
+          const computed = calcRepsFromE1RM(e1rmNum, wNum, laterality);
+          if (computed > 0) {
+            updateSet(s.id, { reps: computed });
+          }
+        }
+      }
+    }
+  };
+
+  const handleRepsChange = (newVal: string) => {
+    const patch: Partial<SetEntry> = { reps: newVal };
+    if (e1rm && !isCardio) {
+      const e1rmNum = parseFloat(String(e1rm));
+      const rNum = parseFloat(newVal);
+      const currentWeight = parseFloat(String(s.weight));
+      const isWeightEmpty = !s.weight || String(s.weight).trim() === "" || isNaN(currentWeight) || currentWeight <= 0;
+      if (e1rmNum > 0 && rNum > 0 && isWeightEmpty) {
+        const computedWeight = calcWeightFromE1RM(e1rmNum, rNum, laterality);
+        if (computedWeight > 0) {
+          patch.weight = computedWeight;
+        }
+      }
+    }
+    updateSet(s.id, patch);
+  };
+
+  const handleRepsBlur = () => {
+    if (e1rm && !isCardio) {
+      const e1rmNum = parseFloat(String(e1rm));
+      const rNum = parseFloat(String(s.reps));
+      const currentWeight = parseFloat(String(s.weight));
+      const isWeightEmpty = !s.weight || String(s.weight).trim() === "" || isNaN(currentWeight) || currentWeight <= 0;
+      if (e1rmNum > 0 && rNum > 0 && isWeightEmpty) {
+        const computedWeight = calcWeightFromE1RM(e1rmNum, rNum, laterality);
+        if (computedWeight > 0) {
+          updateSet(s.id, { weight: computedWeight });
+        }
+      }
+    }
   };
 
   return (
@@ -537,49 +622,91 @@ function SwipeableSetRow({
           {s.type}
         </button>
 
-        {/* Weight Input */}
-        <input
-          className="text-input set-num"
-          type="number"
-          placeholder="Wt"
-          value={s.weight}
-          onChange={(e) => updateSet(s.id, { weight: e.target.value })}
-          style={{ width: "58px", padding: "4px 6px", fontSize: "12px", background: "var(--bg-card)", border: "1px solid var(--border)", borderRadius: "6px" }}
-        />
-        <span style={{ fontSize: "11px", color: "var(--chalk-dim)" }}>{unit || "kg"}</span>
+        {isCardio ? (
+          <>
+            {/* Calories Input */}
+            <div style={{ display: "flex", alignItems: "center", gap: "4px" }}>
+              <input
+                className="text-input set-num"
+                type="number"
+                placeholder="Cal"
+                value={s.calories !== undefined && s.calories !== "" ? s.calories : (s.weight || "")}
+                onChange={(e) => updateSet(s.id, { calories: e.target.value, weight: e.target.value })}
+                style={{ width: "62px", padding: "4px 6px", fontSize: "12px", background: "var(--bg-card)", border: "1px solid var(--border)", borderRadius: "6px", color: "#fb923c", fontWeight: 700 }}
+              />
+              <span style={{ fontSize: "11px", color: "#fb923c", fontWeight: 600 }}>kcal</span>
+            </div>
 
-        <span style={{ color: "var(--chalk-dim)", fontSize: "12px" }}>×</span>
+            <span style={{ color: "var(--chalk-dim)", fontSize: "12px" }}>·</span>
 
-        {/* Reps Input */}
-        <input
-          className="text-input set-num"
-          type="number"
-          placeholder="Reps"
-          value={s.reps}
-          onChange={(e) => updateSet(s.id, { reps: e.target.value })}
-          style={{ width: "48px", padding: "4px 6px", fontSize: "12px", background: "var(--bg-card)", border: "1px solid var(--border)", borderRadius: "6px" }}
-        />
-        <span style={{ fontSize: "11px", color: "var(--chalk-dim)" }}>Reps</span>
+            {/* Minutes Input */}
+            <div style={{ display: "flex", alignItems: "center", gap: "4px" }}>
+              <input
+                className="text-input set-num"
+                type="number"
+                placeholder="Min"
+                value={s.minutes !== undefined && s.minutes !== "" ? s.minutes : (s.reps || "")}
+                onChange={(e) => updateSet(s.id, { minutes: e.target.value, reps: e.target.value })}
+                style={{ width: "52px", padding: "4px 6px", fontSize: "12px", background: "var(--bg-card)", border: "1px solid var(--border)", borderRadius: "6px", color: "#38bdf8", fontWeight: 700 }}
+              />
+              <span style={{ fontSize: "11px", color: "#38bdf8", fontWeight: 600 }}>min</span>
+            </div>
 
-        {/* Raw vs Gear Segmented Switch */}
-        <div className="set-equip-toggle">
-          <button
-            type="button"
-            className={`set-equip-btn ${s.equipment !== 'gear' ? 'is-raw' : ''}`}
-            onClick={() => updateSet(s.id, { equipment: 'raw' })}
-            title="Raw set"
-          >
-            Raw
-          </button>
-          <button
-            type="button"
-            className={`set-equip-btn ${s.equipment === 'gear' ? 'is-gear' : ''}`}
-            onClick={() => updateSet(s.id, { equipment: 'gear' })}
-            title="Gear / Equipped set"
-          >
-            Gear
-          </button>
-        </div>
+            {/* Cardio Indicator Tag */}
+            <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: "3px", padding: "3px 8px", background: "rgba(249, 115, 22, 0.12)", border: "1px solid rgba(249, 115, 22, 0.3)", borderRadius: "6px", color: "#fb923c", fontSize: "10.5px", fontWeight: 700 }}>
+              <Flame size={12} className="text-orange-400" />
+              <span>Cardio</span>
+            </div>
+          </>
+        ) : (
+          <>
+            {/* Weight Input */}
+            <input
+              className="text-input set-num"
+              type="number"
+              placeholder="Wt"
+              value={s.weight}
+              onChange={(e) => handleWeightChange(e.target.value)}
+              onBlur={handleWeightBlur}
+              style={{ width: "58px", padding: "4px 6px", fontSize: "12px", background: "var(--bg-card)", border: "1px solid var(--border)", borderRadius: "6px" }}
+            />
+            <span style={{ fontSize: "11px", color: "var(--chalk-dim)" }}>{unit || "kg"}</span>
+
+            <span style={{ color: "var(--chalk-dim)", fontSize: "12px" }}>×</span>
+
+            {/* Reps Input */}
+            <input
+              className="text-input set-num"
+              type="number"
+              placeholder="Reps"
+              value={s.reps}
+              onChange={(e) => handleRepsChange(e.target.value)}
+              onBlur={handleRepsBlur}
+              style={{ width: "48px", padding: "4px 6px", fontSize: "12px", background: "var(--bg-card)", border: "1px solid var(--border)", borderRadius: "6px" }}
+            />
+            <span style={{ fontSize: "11px", color: "var(--chalk-dim)" }}>Reps</span>
+
+            {/* Raw vs Gear Segmented Switch */}
+            <div className="set-equip-toggle">
+              <button
+                type="button"
+                className={`set-equip-btn ${s.equipment !== 'gear' ? 'is-raw' : ''}`}
+                onClick={() => updateSet(s.id, { equipment: 'raw' })}
+                title="Raw set"
+              >
+                Raw
+              </button>
+              <button
+                type="button"
+                className={`set-equip-btn ${s.equipment === 'gear' ? 'is-gear' : ''}`}
+                onClick={() => updateSet(s.id, { equipment: 'gear' })}
+                title="Gear / Equipped set"
+              >
+                Gear
+              </button>
+            </div>
+          </>
+        )}
       </div>
     </div>
   );
@@ -590,9 +717,11 @@ interface LiftRowItemProps {
   updateLift: (id: string, patch: Partial<LiftEntry>) => void;
   removeLift: (id: string) => void;
   onOpenSetTypeModal: (liftId: string, setId: string) => void;
+  onOpenExerciseHistory?: (name: string, gifUrl?: string) => void;
 }
 
-function LiftRowItem({ l, updateLift, removeLift, onOpenSetTypeModal }: LiftRowItemProps) {
+function LiftRowItem({ l, updateLift, removeLift, onOpenSetTypeModal, onOpenExerciseHistory }: LiftRowItemProps) {
+  const isCardio = isCardioExercise(l);
   const [query, setQuery] = useState(String(l.name));
   const [suggestions, setSuggestions] = useState<{ exerciseId: string; name: string; gifUrl: string }[]>([]);
   const [showDropdown, setShowDropdown] = useState(false);
@@ -621,9 +750,11 @@ function LiftRowItem({ l, updateLift, removeLift, onOpenSetTypeModal }: LiftRowI
       type: String(i + 1),
       weight: (l as any).weight || "",
       reps: (l as any).reps || "",
+      calories: (l as any).calories || "",
+      minutes: (l as any).minutes || "",
       isPR: (l as any).isPR || false,
     }));
-  }, [l.sets, (l as any).weight, (l as any).reps, (l as any).isPR]);
+  }, [l.sets, (l as any).weight, (l as any).reps, (l as any).calories, (l as any).minutes, (l as any).isPR]);
 
   // Persist migrated format to store state
   useEffect(() => {
@@ -634,7 +765,11 @@ function LiftRowItem({ l, updateLift, removeLift, onOpenSetTypeModal }: LiftRowI
 
   const handleNameChange = (val: string) => {
     setQuery(val);
-    updateLift(l.id, { name: val });
+    const cardioDetected = isCardioExercise({ name: val, gifUrl: l.gifUrl });
+    updateLift(l.id, {
+      name: val,
+      ...(l.isCardio === undefined && cardioDetected ? { isCardio: true, unit: "kcal" } : {})
+    });
 
     if (debounceRef.current) clearTimeout(debounceRef.current);
 
@@ -666,8 +801,14 @@ function LiftRowItem({ l, updateLift, removeLift, onOpenSetTypeModal }: LiftRowI
   };
 
   const selectSuggestion = (name: string, gifUrl: string) => {
+    const cardioDetected = isCardioExercise({ name, gifUrl });
     setQuery(name);
-    updateLift(l.id, { name, gifUrl });
+    updateLift(l.id, {
+      name,
+      gifUrl,
+      isCardio: cardioDetected,
+      unit: cardioDetected ? "kcal" : (l.unit && l.unit !== "kcal" ? l.unit : "kg")
+    });
     setShowDropdown(false);
     setSuggestions([]);
   };
@@ -676,7 +817,19 @@ function LiftRowItem({ l, updateLift, removeLift, onOpenSetTypeModal }: LiftRowI
     const nextNum = listSets.filter((s) => !isNaN(Number(s.type))).length + 1;
     const lastSet = listSets[listSets.length - 1];
     const prevEquipment = lastSet?.equipment || 'raw';
-    const newSets = [...listSets, { id: uid(), type: String(nextNum), weight: "", reps: "", isPR: false, equipment: prevEquipment }];
+    const newSets = [
+      ...listSets,
+      {
+        id: uid(),
+        type: String(nextNum),
+        weight: "",
+        reps: "",
+        calories: "",
+        minutes: "",
+        isPR: false,
+        equipment: prevEquipment
+      }
+    ];
     updateLift(l.id, { sets: newSets });
   };
 
@@ -687,6 +840,93 @@ function LiftRowItem({ l, updateLift, removeLift, onOpenSetTypeModal }: LiftRowI
 
   const removeSet = (setId: string) => {
     const newSets = listSets.filter(s => s.id !== setId);
+    updateLift(l.id, { sets: newSets });
+  };
+
+  const bestSet1RM = useMemo(() => {
+    let max = 0;
+    listSets.forEach((s) => {
+      const w = parseFloat(String(s.weight));
+      const r = parseFloat(String(s.reps));
+      if (w > 0 && r > 0) {
+        const est = calcE1RM(w, r);
+        if (est > max) max = est;
+      }
+    });
+    return max;
+  }, [listSets]);
+
+  const handleToggleLaterality = (target: 'bi' | 'uni') => {
+    if ((l.laterality || 'bi') === target) return;
+    const e1rmNum = parseFloat(String(l.e1rm));
+    
+    // Adjust existing sets if any have reps or weight
+    const updatedSets = listSets.map((s) => {
+      const w = parseFloat(String(s.weight));
+      const currentReps = parseFloat(String(s.reps));
+
+      if (e1rmNum > 0 && w > 0) {
+        return { ...s, reps: calcRepsFromE1RM(e1rmNum, w, target) };
+      }
+
+      if (currentReps > 0) {
+        if (target === 'uni') {
+          // Uni: reps divided by 2 (rounded)
+          return { ...s, reps: Math.max(1, Math.round(currentReps / 2)) };
+        } else {
+          // Bilateral: restore standard (multiply by 2)
+          return { ...s, reps: Math.round(currentReps * 2) };
+        }
+      }
+
+      return s;
+    });
+
+    updateLift(l.id, { laterality: target, sets: updatedSets });
+  };
+
+  const handleE1rmChange = (val: string) => {
+    const e1rmNum = parseFloat(val);
+    const currentLaterality = l.laterality || 'bi';
+    if (e1rmNum > 0) {
+      // Auto-compute reps for any existing sets with weight and empty reps, or weight for sets with reps and empty weight
+      const hasUpdates = listSets.some((s) => {
+        const w = parseFloat(String(s.weight));
+        const r = parseFloat(String(s.reps));
+        const needReps = w > 0 && (!s.reps || String(s.reps).trim() === "");
+        const needWeight = r > 0 && (!s.weight || String(s.weight).trim() === "" || isNaN(w) || w <= 0);
+        return needReps || needWeight;
+      });
+      if (hasUpdates) {
+        const newSets = listSets.map((s) => {
+          const w = parseFloat(String(s.weight));
+          const r = parseFloat(String(s.reps));
+          if (w > 0 && (!s.reps || String(s.reps).trim() === "")) {
+            return { ...s, reps: calcRepsFromE1RM(e1rmNum, w, currentLaterality) };
+          }
+          if (r > 0 && (!s.weight || String(s.weight).trim() === "" || isNaN(w) || w <= 0)) {
+            return { ...s, weight: calcWeightFromE1RM(e1rmNum, r, currentLaterality) };
+          }
+          return s;
+        });
+        updateLift(l.id, { e1rm: val, sets: newSets });
+        return;
+      }
+    }
+    updateLift(l.id, { e1rm: val });
+  };
+
+  const handleRecalcAllReps = () => {
+    const e1rmNum = parseFloat(String(l.e1rm));
+    if (!e1rmNum || e1rmNum <= 0) return;
+    const currentLaterality = l.laterality || 'bi';
+    const newSets = listSets.map((s) => {
+      const w = parseFloat(String(s.weight));
+      if (w > 0) {
+        return { ...s, reps: calcRepsFromE1RM(e1rmNum, w, currentLaterality) };
+      }
+      return s;
+    });
     updateLift(l.id, { sets: newSets });
   };
 
@@ -820,7 +1060,7 @@ function LiftRowItem({ l, updateLift, removeLift, onOpenSetTypeModal }: LiftRowI
         style={{
           position: "relative",
           zIndex: 2,
-          border: "1px solid var(--border)",
+          border: isCardio ? "1px solid rgba(249, 115, 22, 0.4)" : "1px solid var(--border)",
           borderRadius: "12px",
           padding: "12px",
           background: "var(--bg-elevated, #1a1e26)",
@@ -836,7 +1076,12 @@ function LiftRowItem({ l, updateLift, removeLift, onOpenSetTypeModal }: LiftRowI
         {/* Header Row */}
         <div className="lift-header" style={{ display: "flex", alignItems: "center", gap: "12px" }}>
           {/* GIF Box Thumbnail */}
-          <div className="lift-gif-box" style={{ width: "48px", height: "48px", borderRadius: "8px", border: "1px solid var(--border)", overflow: "hidden", display: "flex", alignItems: "center", justifyContent: "center", background: "#0a0b0d", flexShrink: 0 }}>
+          <div
+            className="lift-gif-box"
+            onClick={() => l.name?.trim() && onOpenExerciseHistory?.(l.name, l.gifUrl)}
+            style={{ width: "48px", height: "48px", borderRadius: "8px", border: "1px solid var(--border)", overflow: "hidden", display: "flex", alignItems: "center", justifyContent: "center", background: "#0a0b0d", flexShrink: 0, cursor: l.name?.trim() && onOpenExerciseHistory ? "pointer" : "default" }}
+            title={l.name?.trim() && onOpenExerciseHistory ? `View exercise history for ${l.name}` : undefined}
+          >
             {l.gifUrl ? (
               <img src={l.gifUrl} alt={l.name} style={{ width: "100%", height: "100%", objectFit: "cover" }} />
             ) : (
@@ -875,27 +1120,231 @@ function LiftRowItem({ l, updateLift, removeLift, onOpenSetTypeModal }: LiftRowI
             )}
           </div>
 
-          {/* Header Actions (Cross mark removed, now swipe left to delete) */}
+          {/* Header Actions: Mode toggle (Cardio/Weight), unit selector, and add set */}
           <div style={{ display: "flex", alignItems: "center", gap: "6px", flexShrink: 0 }}>
-            <select
-              className="text-input lift-unit"
-              value={l.unit || "kg"}
-              onChange={(e) => updateLift(l.id, { unit: e.target.value })}
-              style={{ width: "60px", padding: "4px 6px", fontSize: "12px", background: "var(--bg-card)", border: "1px solid var(--border)", borderRadius: "6px" }}
+            {/* Mode Switch: Weight vs Cardio */}
+            <button
+              type="button"
+              className="btn-ghost btn-sm"
+              onClick={() => {
+                const nextIsCardio = !isCardio;
+                updateLift(l.id, {
+                  isCardio: nextIsCardio,
+                  unit: nextIsCardio ? "kcal" : (l.unit === "kcal" ? "kg" : l.unit)
+                });
+              }}
+              style={{
+                display: "inline-flex",
+                alignItems: "center",
+                gap: "4px",
+                padding: "3px 8px",
+                fontSize: "11px",
+                fontWeight: 700,
+                borderRadius: "6px",
+                border: isCardio ? "1px solid rgba(249, 115, 22, 0.4)" : "1px solid var(--border)",
+                background: isCardio ? "rgba(249, 115, 22, 0.15)" : "var(--bg-card)",
+                color: isCardio ? "#fb923c" : "var(--chalk-dim)",
+                cursor: "pointer",
+                transition: "all 0.15s ease",
+              }}
+              title={isCardio ? "Cardio Mode (Calories & Minutes) — click to switch to Weight" : "Weight Mode — click to switch to Cardio"}
             >
-              <option value="kg">kg</option>
-              <option value="lb">lb</option>
-            </select>
+              {isCardio ? (
+                <>
+                  <Flame size={12} className="text-orange-400" />
+                  <span>Cardio</span>
+                </>
+              ) : (
+                <>
+                  <Dumbbell size={12} />
+                  <span>Weight</span>
+                </>
+              )}
+            </button>
+
+            {!isCardio && (
+              <select
+                className="text-input lift-unit"
+                value={l.unit || "kg"}
+                onChange={(e) => updateLift(l.id, { unit: e.target.value })}
+                style={{ width: "56px", padding: "4px 6px", fontSize: "12px", background: "var(--bg-card)", border: "1px solid var(--border)", borderRadius: "6px" }}
+              >
+                <option value="kg">kg</option>
+                <option value="lb">lb</option>
+              </select>
+            )}
+
             <button
               type="button"
               className="btn-ghost btn-sm"
               onClick={addSet}
               style={{ padding: "4px 8px", fontSize: "11px", height: "auto" }}
             >
-              + Set
+              {isCardio ? "+ Interval" : "+ Set"}
             </button>
           </div>
         </div>
+
+        {/* E1RM Common Box & Controls for Resistance Lifts */}
+        {!isCardio && (
+          <div
+            className="lift-e1rm-bar"
+            style={{
+              paddingLeft: "60px",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between",
+              gap: "8px",
+              flexWrap: "wrap",
+              paddingTop: "2px",
+              paddingBottom: "2px",
+            }}
+          >
+            <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+              <div
+                style={{
+                  display: "inline-flex",
+                  alignItems: "center",
+                  gap: "4px",
+                  fontSize: "11px",
+                  fontWeight: 700,
+                  color: l.e1rm ? "#38bdf8" : "var(--chalk-dim)",
+                  letterSpacing: "0.5px",
+                }}
+                title="Estimated 1-Rep Max (E1RM). When set, typing a set weight automatically calculates target reps to match this 1RM."
+              >
+                <Target size={13} style={{ color: l.e1rm ? "#38bdf8" : "var(--chalk-dim)" }} />
+                <span>E1RM:</span>
+              </div>
+
+              <input
+                className="text-input lift-e1rm-input"
+                type="number"
+                placeholder="e.g. 130"
+                value={l.e1rm !== undefined && l.e1rm !== null ? l.e1rm : ""}
+                onChange={(e) => handleE1rmChange(e.target.value)}
+                style={{
+                  width: "66px",
+                  padding: "3px 6px",
+                  fontSize: "12px",
+                  fontWeight: 700,
+                  background: "var(--bg-card, #12151c)",
+                  border: l.e1rm ? "1px solid rgba(56, 189, 248, 0.45)" : "1px solid var(--border)",
+                  borderRadius: "6px",
+                  color: l.e1rm ? "#38bdf8" : "var(--chalk)",
+                  textAlign: "center",
+                  transition: "all 0.15s ease",
+                }}
+              />
+              <span style={{ fontSize: "11px", color: "var(--chalk-dim)", fontWeight: 600 }}>
+                {l.unit || "kg"}
+              </span>
+
+              {/* Bilateral / Unilateral Segmented Switch */}
+              <div
+                className="laterality-toggle-group"
+                style={{
+                  display: "inline-flex",
+                  alignItems: "center",
+                  background: "var(--bg-card, #12151c)",
+                  border: "1px solid var(--border)",
+                  borderRadius: "6px",
+                  padding: "1px",
+                  marginLeft: "2px",
+                }}
+              >
+                <button
+                  type="button"
+                  onClick={() => handleToggleLaterality('bi')}
+                  style={{
+                    padding: "2px 7px",
+                    fontSize: "10.5px",
+                    fontWeight: 700,
+                    borderRadius: "5px",
+                    border: "none",
+                    background: (l.laterality || 'bi') === 'bi' ? "rgba(56, 189, 248, 0.22)" : "transparent",
+                    color: (l.laterality || 'bi') === 'bi' ? "#38bdf8" : "var(--chalk-dim)",
+                    cursor: "pointer",
+                    transition: "all 0.15s ease",
+                  }}
+                  title="Bilateral (both limbs) — standard calculated reps"
+                >
+                  Bi
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handleToggleLaterality('uni')}
+                  style={{
+                    padding: "2px 7px",
+                    fontSize: "10.5px",
+                    fontWeight: 700,
+                    borderRadius: "5px",
+                    border: "none",
+                    background: l.laterality === 'uni' ? "rgba(168, 85, 247, 0.28)" : "transparent",
+                    color: l.laterality === 'uni' ? "#c084fc" : "var(--chalk-dim)",
+                    cursor: "pointer",
+                    transition: "all 0.15s ease",
+                  }}
+                  title="Unilateral (single limb) — reps divided by 2 (rounded)"
+                >
+                  Uni
+                </button>
+              </div>
+            </div>
+
+            {/* Quick Actions / Indicator */}
+            {l.e1rm && parseFloat(String(l.e1rm)) > 0 ? (
+              <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+                <button
+                  type="button"
+                  className="btn-ghost btn-sm"
+                  onClick={handleRecalcAllReps}
+                  title="Recalculate reps for all sets matching this E1RM"
+                  style={{
+                    padding: "2px 7px",
+                    fontSize: "10.5px",
+                    fontWeight: 700,
+                    height: "auto",
+                    color: "#38bdf8",
+                    borderColor: "rgba(56, 189, 248, 0.3)",
+                    background: "rgba(56, 189, 248, 0.08)",
+                    borderRadius: "5px",
+                    display: "inline-flex",
+                    alignItems: "center",
+                    gap: "3px",
+                    cursor: "pointer",
+                  }}
+                >
+                  <Sparkles size={11} />
+                  <span>Calc Reps</span>
+                </button>
+              </div>
+            ) : bestSet1RM > 0 ? (
+              <button
+                type="button"
+                onClick={() => handleE1rmChange(String(bestSet1RM))}
+                style={{
+                  background: "transparent",
+                  border: "none",
+                  color: "var(--chalk-dim)",
+                  fontSize: "10.5px",
+                  cursor: "pointer",
+                  display: "inline-flex",
+                  alignItems: "center",
+                  gap: "3px",
+                  padding: 0,
+                }}
+                title={`Click to set E1RM to ${bestSet1RM} ${l.unit || "kg"} from your best logged set`}
+              >
+                <span>Use best: <span style={{ color: "#38bdf8", fontWeight: 700 }}>{bestSet1RM} {l.unit || "kg"}</span></span>
+              </button>
+            ) : (
+              <span style={{ fontSize: "10px", color: "var(--chalk-dim)", opacity: 0.65 }}>
+                ⚡ Auto-calculates reps
+              </span>
+            )}
+          </div>
+        )}
 
         {/* Sets List (Indented with SwipeableSetRows) */}
         <div className="lift-sets-list" style={{ paddingLeft: "60px", display: "flex", flexDirection: "column", gap: "6px" }}>
@@ -904,10 +1353,13 @@ function LiftRowItem({ l, updateLift, removeLift, onOpenSetTypeModal }: LiftRowI
               key={s.id}
               s={s}
               unit={l.unit}
+              isCardio={isCardio}
               listSetsLength={listSets.length}
               onOpenTypeModal={() => onOpenSetTypeModal(l.id, s.id)}
               updateSet={updateSet}
               removeSet={removeSet}
+              e1rm={l.e1rm}
+              laterality={l.laterality || 'bi'}
             />
           ))}
         </div>
@@ -918,11 +1370,12 @@ function LiftRowItem({ l, updateLift, removeLift, onOpenSetTypeModal }: LiftRowI
 
 
 
-function DayModal({ day, phaseColor, onClose, onSave, onDelete, onDiscard, onUpdateDraft, onGoToExerciseLibrary, onPerformAgain, initialEditMode = false, isLive = false }: {
+function DayModal({ day, phaseColor, onClose, onSave, onDelete, onDiscard, onUpdateDraft, onGoToExerciseLibrary, onPerformAgain, initialEditMode = false, isLive = false, onOpenExerciseHistory }: {
   day: DayEntry; phaseColor: string; onClose: () => void; onSave: (d: DayEntry) => void; onDelete: (id: string) => void; onDiscard?: () => void; onUpdateDraft: (d: DayEntry) => void; onGoToExerciseLibrary: () => void;
   onPerformAgain?: (d: DayEntry) => void;
   initialEditMode?: boolean;
   isLive?: boolean;
+  onOpenExerciseHistory?: (name: string, gifUrl?: string) => void;
 }) {
   const [type, setType] = useState(day.type === "empty" ? "workout" : day.type);
   const [title, setTitle] = useState(day.title);
@@ -989,6 +1442,7 @@ function DayModal({ day, phaseColor, onClose, onSave, onDelete, onDiscard, onUpd
 
   const totalVolume = useMemo(() => {
     return (lifts || []).reduce((acc, lift) => {
+      if (isCardioExercise(lift)) return acc;
       const sets = Array.isArray(lift.sets) ? lift.sets : [];
       const liftVol = sets.reduce((sum, s) => {
         const w = parseFloat(String(s.weight)) || 0;
@@ -996,6 +1450,17 @@ function DayModal({ day, phaseColor, onClose, onSave, onDelete, onDiscard, onUpd
         return sum + (w * r);
       }, 0);
       return acc + liftVol;
+    }, 0);
+  }, [lifts]);
+
+  const totalCalories = useMemo(() => {
+    return (lifts || []).reduce((acc, lift) => {
+      if (!isCardioExercise(lift)) return acc;
+      const sets = Array.isArray(lift.sets) ? lift.sets : [];
+      return acc + sets.reduce((sum, s) => {
+        const c = parseFloat(String(s.calories !== undefined && s.calories !== "" ? s.calories : s.weight)) || 0;
+        return sum + c;
+      }, 0);
     }, 0);
   }, [lifts]);
 
@@ -1215,6 +1680,18 @@ function DayModal({ day, phaseColor, onClose, onSave, onDelete, onDiscard, onUpd
                       </div>
                     </div>
 
+                    {totalCalories > 0 && (
+                      <div className="workout-live-stat-card">
+                        <div className="workout-stat-header">
+                          <Flame size={11} className="text-orange-400 flex-shrink-0" />
+                          <span className="workout-stat-label">Calories</span>
+                        </div>
+                        <div className="workout-stat-value text-orange-400">
+                          {Math.round(totalCalories).toLocaleString()}<span className="workout-stat-unit">kcal</span>
+                        </div>
+                      </div>
+                    )}
+
                     <div className="workout-live-stat-card">
                       <div className="workout-stat-header">
                         <Layers size={11} className="text-amber-400 flex-shrink-0" />
@@ -1234,72 +1711,112 @@ function DayModal({ day, phaseColor, onClose, onSave, onDelete, onDiscard, onUpd
                       No exercises in this session.
                     </div>
                   ) : (
-                    lifts.map((l) => (
-                      <div
-                        key={l.id}
-                        style={{
-                          border: "1px solid var(--border)",
-                          borderRadius: "10px",
-                          padding: "12px",
-                          background: "var(--bg-elevated)",
-                          display: "flex",
-                          flexDirection: "column",
-                          gap: "8px",
-                        }}
-                      >
-                        {/* Lift Name & Thumbnail */}
-                        <div style={{ display: "flex", alignItems: "center", gap: "12px" }}>
-                          <div style={{ width: "42px", height: "42px", borderRadius: "8px", border: "1px solid var(--border)", overflow: "hidden", display: "flex", alignItems: "center", justifyContent: "center", background: "#0a0b0d", flexShrink: 0 }}>
-                            {l.gifUrl ? (
-                              <img src={l.gifUrl} alt={l.name} style={{ width: "100%", height: "100%", objectFit: "cover" }} />
-                            ) : (
-                              <PlateIcon size={16} color="var(--chalk-dim)" />
-                            )}
-                          </div>
-                          <div style={{ flex: 1, minWidth: 0 }}>
-                            <div style={{ fontWeight: 700, fontSize: "15px", fontFamily: "Oswald, sans-serif", color: "#ffffff" }}>
-                              {l.name}
-                            </div>
-                            <div style={{ fontSize: "11px", color: "var(--chalk-dim)" }}>
-                              {(l.sets || []).length} {(l.sets || []).length === 1 ? "set" : "sets"}
-                            </div>
-                          </div>
-                        </div>
-
-                        {/* Sets list in clean read-only format */}
-                        <div style={{ paddingLeft: "54px", display: "flex", flexDirection: "column", gap: "6px" }}>
-                          {(l.sets || []).map((s) => (
-                            <div key={s.id} style={{ display: "flex", alignItems: "center", gap: "10px", fontSize: "13px" }}>
-                              <span
-                                className="set-type-badge-btn"
-                                style={{
-                                  color: getSetTypeColor(s.type),
-                                  cursor: "default",
-                                  pointerEvents: "none",
-                                  width: "36px",
-                                  height: "26px",
-                                  fontSize: "12px",
-                                }}
-                              >
-                                {s.type}
-                              </span>
-                              <span style={{ fontWeight: 600, color: "var(--chalk)" }}>
-                                {s.weight || 0} {l.unit || "kg"}
-                              </span>
-                              <span style={{ color: "var(--chalk-dim)", fontSize: "12px" }}>×</span>
-                              <span style={{ fontWeight: 600, color: "var(--chalk)" }}>
-                                {s.reps || 0} reps
-                              </span>
-                              {s.equipment === 'gear' ? (
-                                <span className="read-gear-badge">Gear</span>
+                    lifts.map((l) => {
+                      const cardio = isCardioExercise(l);
+                      return (
+                        <div
+                          key={l.id}
+                          style={{
+                            border: cardio ? "1px solid rgba(249, 115, 22, 0.4)" : "1px solid var(--border)",
+                            borderRadius: "10px",
+                            padding: "12px",
+                            background: "var(--bg-elevated)",
+                            display: "flex",
+                            flexDirection: "column",
+                            gap: "8px",
+                          }}
+                        >
+                          {/* Lift Name & Thumbnail - Clickable to open Exercise History */}
+                          <div
+                            onClick={() => onOpenExerciseHistory?.(l.name, l.gifUrl)}
+                            style={{
+                              display: "flex",
+                              alignItems: "center",
+                              gap: "12px",
+                              cursor: "pointer",
+                              userSelect: "none",
+                              padding: "2px 0",
+                            }}
+                            title={`View exercise history for ${l.name}`}
+                          >
+                            <div style={{ width: "42px", height: "42px", borderRadius: "8px", border: "1px solid var(--border)", overflow: "hidden", display: "flex", alignItems: "center", justifyContent: "center", background: "#0a0b0d", flexShrink: 0 }}>
+                              {l.gifUrl ? (
+                                <img src={l.gifUrl} alt={l.name} style={{ width: "100%", height: "100%", objectFit: "cover" }} />
                               ) : (
-                                <span className="read-raw-badge">Raw</span>
+                                <PlateIcon size={16} color="var(--chalk-dim)" />
                               )}
                             </div>
-                          ))}
+                            <div style={{ flex: 1, minWidth: 0 }}>
+                              <div style={{ fontWeight: 700, fontSize: "15px", fontFamily: "Oswald, sans-serif", color: "#ffffff", display: "flex", alignItems: "center", gap: "6px" }}>
+                                <span>{l.name}</span>
+                                {cardio && (
+                                  <span style={{ fontSize: "10.5px", fontWeight: 700, color: "#fb923c", background: "rgba(249, 115, 22, 0.12)", border: "1px solid rgba(249, 115, 22, 0.3)", padding: "1px 6px", borderRadius: "4px" }}>
+                                    Cardio
+                                  </span>
+                                )}
+                                {!cardio && l.e1rm && (
+                                  <span style={{ fontSize: "10.5px", fontWeight: 700, color: "#38bdf8", background: "rgba(56, 189, 248, 0.12)", border: "1px solid rgba(56, 189, 248, 0.3)", padding: "1px 6px", borderRadius: "4px", display: "inline-flex", alignItems: "center", gap: "3px" }}>
+                                    🎯 1RM {l.e1rm} {l.unit || "kg"}
+                                  </span>
+                                )}
+                              </div>
+                              <div style={{ fontSize: "11px", color: "var(--chalk-dim)" }}>
+                                {(l.sets || []).length} {(l.sets || []).length === 1 ? (cardio ? "interval" : "set") : (cardio ? "intervals" : "sets")}
+                              </div>
+                            </div>
+                            <ChevronRight size={18} style={{ color: "var(--chalk-dim)", flexShrink: 0 }} />
+                          </div>
+
+                          {/* Sets list in clean read-only format */}
+                          <div style={{ paddingLeft: "54px", display: "flex", flexDirection: "column", gap: "6px" }}>
+                            {(l.sets || []).map((s) => (
+                              <div key={s.id} style={{ display: "flex", alignItems: "center", gap: "10px", fontSize: "13px" }}>
+                                <span
+                                  className="set-type-badge-btn"
+                                  style={{
+                                    color: getSetTypeColor(s.type),
+                                    cursor: "default",
+                                    pointerEvents: "none",
+                                    width: "36px",
+                                    height: "26px",
+                                    fontSize: "12px",
+                                  }}
+                                >
+                                  {s.type}
+                                </span>
+                                {cardio ? (
+                                  <>
+                                    <span style={{ fontWeight: 600, color: "#fb923c", display: "inline-flex", alignItems: "center", gap: "4px" }}>
+                                      <Flame size={12} className="text-orange-400" />
+                                      {s.calories !== undefined && s.calories !== "" ? s.calories : (s.weight || 0)} kcal
+                                    </span>
+                                    <span style={{ color: "var(--chalk-dim)", fontSize: "12px" }}>·</span>
+                                    <span style={{ fontWeight: 600, color: "#38bdf8" }}>
+                                      {s.minutes !== undefined && s.minutes !== "" ? s.minutes : (s.reps || 0)} min
+                                    </span>
+                                  </>
+                                ) : (
+                                  <>
+                                    <span style={{ fontWeight: 600, color: "var(--chalk)" }}>
+                                      {s.weight || 0} {l.unit || "kg"}
+                                    </span>
+                                    <span style={{ color: "var(--chalk-dim)", fontSize: "12px" }}>×</span>
+                                    <span style={{ fontWeight: 600, color: "var(--chalk)" }}>
+                                      {s.reps || 0} reps
+                                    </span>
+                                    {s.equipment === 'gear' ? (
+                                      <span className="read-gear-badge">Gear</span>
+                                    ) : (
+                                      <span className="read-raw-badge">Raw</span>
+                                    )}
+                                  </>
+                                )}
+                              </div>
+                            ))}
+                          </div>
                         </div>
-                      </div>
-                    ))
+                      );
+                    })
                   )}
                 </div>
 
@@ -1369,6 +1886,18 @@ function DayModal({ day, phaseColor, onClose, onSave, onDelete, onDiscard, onUpd
                       </div>
                     </div>
 
+                    {totalCalories > 0 && (
+                      <div className="workout-live-stat-card">
+                        <div className="workout-stat-header">
+                          <Flame size={11} className="text-orange-400 flex-shrink-0" />
+                          <span className="workout-stat-label">Calories</span>
+                        </div>
+                        <div className="workout-stat-value text-orange-400">
+                          {Math.round(totalCalories).toLocaleString()}<span className="workout-stat-unit">kcal</span>
+                        </div>
+                      </div>
+                    )}
+
                     {/* Sets */}
                     <div className="workout-live-stat-card">
                       <div className="workout-stat-header">
@@ -1423,6 +1952,7 @@ function DayModal({ day, phaseColor, onClose, onSave, onDelete, onDiscard, onUpd
                               setActiveSetTypeModalInfo({ liftId, setId });
                               setActiveInfo(null);
                             }}
+                            onOpenExerciseHistory={onOpenExerciseHistory}
                           />
                         ))}
 
@@ -2109,6 +2639,7 @@ export default function IronLedger() {
   const [isDayModalMinimized, setIsDayModalMinimized] = useState(false);
   const [showResumeDiscardPrompt, setShowResumeDiscardPrompt] = useState(false);
   const [isNavDrawerOpen, setIsNavDrawerOpen] = useState(false);
+  const [viewingHistoryExercise, setViewingHistoryExercise] = useState<{ name: string; gifUrl?: string } | null>(null);
   const today = todayStr();
 
   useEffect(() => {
@@ -2133,8 +2664,25 @@ export default function IronLedger() {
   };
 
   const handlePerformAgain = (sourceDay: DayEntry) => {
-    const meso = selectedMeso || mesocycles.find((m) => m.status === "active") || mesocycles[0];
-    if (!meso) return;
+    let targetMeso = selectedMeso || mesocycles.find((m) => m.status === "active") || mesocycles[0];
+    let targetMicId = targetMeso?.microcycles[0]?.id || "";
+    let targetDay = targetMeso?.microcycles[0]?.days[0];
+
+    // Find today's day entry across mesocycles
+    for (const m of mesocycles) {
+      for (const mc of m.microcycles) {
+        const found = mc.days.find((d) => d.date === today);
+        if (found) {
+          targetMeso = m;
+          targetMicId = mc.id;
+          targetDay = found;
+          break;
+        }
+      }
+      if (targetDay && targetDay.date === today) break;
+    }
+
+    if (!targetMeso || !targetDay || !targetMicId) return;
 
     const clonedLifts: LiftEntry[] = (sourceDay.lifts || []).map((l) => ({
       ...l,
@@ -2145,19 +2693,6 @@ export default function IronLedger() {
         isPR: false,
       })),
     }));
-
-    let targetMicId = meso.microcycles[0]?.id || "";
-    let targetDay = meso.microcycles[0]?.days[0];
-    for (const mc of meso.microcycles) {
-      const found = mc.days.find((d) => d.date === today);
-      if (found) {
-        targetMicId = mc.id;
-        targetDay = found;
-        break;
-      }
-    }
-
-    if (!targetDay || !targetMicId) return;
 
     const originalSnapshot: DayEntry = JSON.parse(JSON.stringify(targetDay));
 
@@ -2172,7 +2707,7 @@ export default function IronLedger() {
 
     updateDayDraft(newDay);
     const liveSession = {
-      mesoId: meso.id,
+      mesoId: targetMeso.id,
       micId: targetMicId,
       day: newDay,
       initialEditMode: true,
@@ -2192,27 +2727,54 @@ export default function IronLedger() {
   };
 
   const handleStartNewWorkout = () => {
-    const meso = selectedMeso || mesocycles.find((m) => m.status === "active") || mesocycles[mesocycles.length - 1];
-    if (!meso) return;
-    
-    // Find today's day entry in the mesocycle
-    for (const mc of meso.microcycles) {
-      const todayDay = mc.days.find((d: DayEntry) => d.date === today);
-      if (todayDay) {
-        const originalSnapshot: DayEntry = JSON.parse(JSON.stringify(todayDay));
-        const liveSession = { mesoId: meso.id, micId: mc.id, day: todayDay, initialEditMode: true, originalDay: originalSnapshot };
-        setLiveWorkout(liveSession);
-        setActiveDay({ ...liveSession, isLive: true });
-        setIsDayModalMinimized(false);
-        return;
+    // 1. Search for today's session across mesocycles, starting with preferred meso
+    let targetMeso: Mesocycle | undefined;
+    let targetMic: Microcycle | undefined;
+    let todayDay: DayEntry | undefined;
+
+    const preferredMeso = selectedMeso || mesocycles.find((m) => m.status === "active");
+    if (preferredMeso) {
+      for (const mc of preferredMeso.microcycles) {
+        const found = mc.days.find((d: DayEntry) => d.date === today);
+        if (found) {
+          targetMeso = preferredMeso;
+          targetMic = mc;
+          todayDay = found;
+          break;
+        }
       }
     }
-    
+
+    if (!todayDay) {
+      for (const m of mesocycles) {
+        for (const mc of m.microcycles) {
+          const found = mc.days.find((d: DayEntry) => d.date === today);
+          if (found) {
+            targetMeso = m;
+            targetMic = mc;
+            todayDay = found;
+            break;
+          }
+        }
+        if (todayDay) break;
+      }
+    }
+
+    if (targetMeso && targetMic && todayDay) {
+      const originalSnapshot: DayEntry = JSON.parse(JSON.stringify(todayDay));
+      const liveSession = { mesoId: targetMeso.id, micId: targetMic.id, day: todayDay, initialEditMode: true, originalDay: originalSnapshot };
+      setLiveWorkout(liveSession);
+      setActiveDay({ ...liveSession, isLive: true });
+      setIsDayModalMinimized(false);
+      return;
+    }
+
     // Fallback: pick the first day of the active microcycle
-    if (meso.microcycles.length > 0 && meso.microcycles[0].days.length > 0) {
-      const mc = meso.microcycles[0];
+    const fallbackMeso = preferredMeso || mesocycles[mesocycles.length - 1];
+    if (fallbackMeso && fallbackMeso.microcycles.length > 0 && fallbackMeso.microcycles[0].days.length > 0) {
+      const mc = fallbackMeso.microcycles[0];
       const originalSnapshot: DayEntry = JSON.parse(JSON.stringify(mc.days[0]));
-      const liveSession = { mesoId: meso.id, micId: mc.id, day: mc.days[0], initialEditMode: true, originalDay: originalSnapshot };
+      const liveSession = { mesoId: fallbackMeso.id, micId: mc.id, day: mc.days[0], initialEditMode: true, originalDay: originalSnapshot };
       setLiveWorkout(liveSession);
       setActiveDay({ ...liveSession, isLive: true });
       setIsDayModalMinimized(false);
@@ -2359,21 +2921,59 @@ export default function IronLedger() {
   const handleAddExerciseToActiveDay = (name: string, gifUrl?: string) => {
     let currentActive = activeDay;
     if (!currentActive) {
-      const meso = selectedMeso || mesocycles.find((m) => m.status === "active") || mesocycles[mesocycles.length - 1];
-      if (meso && meso.microcycles.length > 0 && meso.microcycles[0].days.length > 0) {
-        const mc = meso.microcycles[0];
-        const day = mc.days[0];
-        currentActive = { mesoId: meso.id, micId: mc.id, day, isLive: false };
+      // Find today's session across mesocycles
+      let foundMeso: Mesocycle | undefined;
+      let foundMic: Microcycle | undefined;
+      let foundDay: DayEntry | undefined;
+
+      const preferredMeso = selectedMeso || mesocycles.find((m) => m.status === "active");
+      if (preferredMeso) {
+        for (const mc of preferredMeso.microcycles) {
+          const d = mc.days.find((day) => day.date === today);
+          if (d) {
+            foundMeso = preferredMeso;
+            foundMic = mc;
+            foundDay = d;
+            break;
+          }
+        }
+      }
+      if (!foundDay) {
+        for (const m of mesocycles) {
+          for (const mc of m.microcycles) {
+            const d = mc.days.find((day) => day.date === today);
+            if (d) {
+              foundMeso = m;
+              foundMic = mc;
+              foundDay = d;
+              break;
+            }
+          }
+          if (foundDay) break;
+        }
+      }
+
+      if (foundMeso && foundMic && foundDay) {
+        currentActive = { mesoId: foundMeso.id, micId: foundMic.id, day: foundDay, isLive: false };
+      } else {
+        const meso = preferredMeso || mesocycles[mesocycles.length - 1];
+        if (meso && meso.microcycles.length > 0 && meso.microcycles[0].days.length > 0) {
+          const mc = meso.microcycles[0];
+          const day = mc.days[0];
+          currentActive = { mesoId: meso.id, micId: mc.id, day, isLive: false };
+        }
       }
     }
     if (!currentActive) return;
 
+    const isCardio = isCardioExercise({ name, gifUrl });
     const newLift: LiftEntry = {
       id: uid(),
       name,
       gifUrl: gifUrl || "",
-      unit: "kg",
-      sets: [{ id: uid(), type: "1", weight: "", reps: "", isPR: false }]
+      unit: isCardio ? "kcal" : "kg",
+      isCardio,
+      sets: [{ id: uid(), type: "1", weight: "", reps: "", calories: "", minutes: "", isPR: false }]
     };
     const updatedDay: DayEntry = {
       ...currentActive.day,
@@ -2406,22 +3006,61 @@ export default function IronLedger() {
     if (!exercisesList || exercisesList.length === 0) return;
     let currentActive = activeDay;
     if (!currentActive) {
-      const meso = selectedMeso || mesocycles.find((m) => m.status === "active") || mesocycles[mesocycles.length - 1];
-      if (meso && meso.microcycles.length > 0 && meso.microcycles[0].days.length > 0) {
-        const mc = meso.microcycles[0];
-        const day = mc.days[0];
-        currentActive = { mesoId: meso.id, micId: mc.id, day, initialEditMode: true, isLive: false };
+      let foundMeso: Mesocycle | undefined;
+      let foundMic: Microcycle | undefined;
+      let foundDay: DayEntry | undefined;
+
+      const preferredMeso = selectedMeso || mesocycles.find((m) => m.status === "active");
+      if (preferredMeso) {
+        for (const mc of preferredMeso.microcycles) {
+          const d = mc.days.find((day) => day.date === today);
+          if (d) {
+            foundMeso = preferredMeso;
+            foundMic = mc;
+            foundDay = d;
+            break;
+          }
+        }
+      }
+      if (!foundDay) {
+        for (const m of mesocycles) {
+          for (const mc of m.microcycles) {
+            const d = mc.days.find((day) => day.date === today);
+            if (d) {
+              foundMeso = m;
+              foundMic = mc;
+              foundDay = d;
+              break;
+            }
+          }
+          if (foundDay) break;
+        }
+      }
+
+      if (foundMeso && foundMic && foundDay) {
+        currentActive = { mesoId: foundMeso.id, micId: foundMic.id, day: foundDay, initialEditMode: true, isLive: false };
+      } else {
+        const meso = preferredMeso || mesocycles[mesocycles.length - 1];
+        if (meso && meso.microcycles.length > 0 && meso.microcycles[0].days.length > 0) {
+          const mc = meso.microcycles[0];
+          const day = mc.days[0];
+          currentActive = { mesoId: meso.id, micId: mc.id, day, initialEditMode: true, isLive: false };
+        }
       }
     }
     if (!currentActive) return;
 
-    const newLifts: LiftEntry[] = exercisesList.map((ex) => ({
-      id: uid(),
-      name: ex.name,
-      gifUrl: ex.gifUrl || "",
-      unit: "kg",
-      sets: [{ id: uid(), type: "1", weight: "", reps: "", isPR: false }]
-    }));
+    const newLifts: LiftEntry[] = exercisesList.map((ex) => {
+      const isCardio = isCardioExercise(ex);
+      return {
+        id: uid(),
+        name: ex.name,
+        gifUrl: ex.gifUrl || "",
+        unit: isCardio ? "kcal" : "kg",
+        isCardio,
+        sets: [{ id: uid(), type: "1", weight: "", reps: "", calories: "", minutes: "", isPR: false }]
+      };
+    });
 
     const updatedDay: DayEntry = {
       ...currentActive.day,
@@ -2519,7 +3158,14 @@ export default function IronLedger() {
     setMacrocycles((prev) => prev.map((m) => m.id === macroId ? { ...m, name: newName } : m));
   };
 
-  const updateMesocycle = (mesoId: string, updates: { name: string; phaseKey: string; start: string; macroId: string }) => {
+  const updateMesocycle = (mesoId: string, updates: { 
+    name: string; 
+    phaseKey: string; 
+    start: string; 
+    macroId: string;
+    targets?: PhaseTarget[];
+    notes?: string;
+  }) => {
     setMesocycles((prev) => {
       const updated = prev.map((m) => {
         if (m.id !== mesoId) return m;
@@ -2544,6 +3190,7 @@ export default function IronLedger() {
             return {
               ...newMc,
               label: oldMc.label,
+              note: oldMc.note,
               days: newMc.days.map((newDay, dayIdx) => {
                 const oldDay = oldMc.days[dayIdx];
                 if (!oldDay || oldDay.type === "empty") return newDay;
@@ -2569,6 +3216,8 @@ export default function IronLedger() {
           status,
           macroId: updates.macroId || m.macroId,
           microcycles,
+          targets: updates.targets !== undefined ? updates.targets : m.targets,
+          notes: updates.notes !== undefined ? updates.notes : m.notes,
         };
       });
 
@@ -2585,6 +3234,21 @@ export default function IronLedger() {
           ...m,
           microcycles: m.microcycles.map((mc) =>
             mc.id === micId ? { ...mc, label: newLabel || null } : mc
+          ),
+        };
+      })
+    );
+  };
+
+  const updateMicrocycleNote = (micId: string, note: string) => {
+    setMesocycles((prev) =>
+      prev.map((m) => {
+        const hasMic = m.microcycles.some((mc) => mc.id === micId);
+        if (!hasMic) return m;
+        return {
+          ...m,
+          microcycles: m.microcycles.map((mc) =>
+            mc.id === micId ? { ...mc, note: note || undefined } : mc
           ),
         };
       })
@@ -3523,6 +4187,7 @@ export default function IronLedger() {
           onDayClick={(mesoId, micId, day, initialEditMode) => openDay(mesoId, micId, day, initialEditMode)}
           onDeleteDay={(dayId) => clearDay(dayId)}
           onPerformAgain={(day) => handlePerformAgain(day)}
+          onOpenExerciseHistory={(name, gifUrl) => setViewingHistoryExercise({ name, gifUrl })}
         />
       )}
 
@@ -3542,6 +4207,7 @@ export default function IronLedger() {
           onDeleteMeso={deleteMesocycle}
           onDeleteMicrocycle={(mesoId, micId) => deleteMicrocycle(mesoId, micId)}
           onRenameMicrocycle={(_mesoId, micId, newLabel) => renameMicrocycle(micId, newLabel)}
+          onUpdateMicrocycleNote={(_mesoId, micId, note) => updateMicrocycleNote(micId, note)}
           onSetActiveMeso={setActiveMesocycleStatus}
           onRenameMacro={renameMacrocycle}
           onDeleteMacro={deleteMacrocycle}
@@ -3558,7 +4224,17 @@ export default function IronLedger() {
 
       {activeTab === 'explore' && (
         <div className="max-w-4xl mx-auto space-y-6 pt-2 pb-24">
-          <Analytics entries={workoutEntries} />
+          <Analytics
+            entries={workoutEntries}
+            mesocycles={mesocycles}
+            macrocycles={macrocycles}
+            today={today}
+            prLog={prLog}
+            onOpenDay={(mesoId, micId, day) => {
+              setSelectedId(mesoId);
+              openDay(mesoId, micId, day as any, false);
+            }}
+          />
         </div>
       )}
 
@@ -3596,6 +4272,7 @@ export default function IronLedger() {
             setActiveDay((prev) => prev ? { ...prev, initialEditMode: true } : null);
           }}
           onPerformAgain={(d) => handlePerformAgain(d)}
+          onOpenExerciseHistory={(name, gifUrl) => setViewingHistoryExercise({ name, gifUrl })}
         />
       )}
 
@@ -3664,6 +4341,21 @@ export default function IronLedger() {
           defaultStart={mesocycles[mesocycles.length - 1]?.end ? addDays(mesocycles[mesocycles.length - 1].end, 1) : today}
           onClose={() => setAddingMacro(false)}
           onCreate={createMacrocycle}
+        />
+      )}
+
+      {/* Exercise History & Details Modal */}
+      {viewingHistoryExercise && (
+        <ExerciseHistoryModal
+          exerciseName={viewingHistoryExercise.name}
+          gifUrl={viewingHistoryExercise.gifUrl}
+          mesocycles={mesocycles}
+          macrocycles={macrocycles}
+          onClose={() => setViewingHistoryExercise(null)}
+          onOpenSession={(mesoId, micId, day) => {
+            setSelectedId(mesoId);
+            openDay(mesoId, micId, day as any, false);
+          }}
         />
       )}
 

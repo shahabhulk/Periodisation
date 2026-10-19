@@ -24,6 +24,9 @@ import {
 import confetti from 'canvas-confetti';
 import { formatDateDMY } from '../utils/workoutUtils';
 import { PeriodisationAnalysisView } from './PeriodisationAnalysisView';
+import { AISettingsModal } from './AISettingsModal';
+import { suggestMesocycleStrategy } from '../services/geminiService';
+import { buildComprehensiveTrainingContext } from '../services/appDataService';
 import type { PhaseTarget } from '../types/workout';
 
 const PHASES: Record<string, { color: string; label: string; description: string }> = {
@@ -141,6 +144,8 @@ interface PeriodisationSettingsViewProps {
   macrocycles: Macrocycle[];
   mesocycles: Mesocycle[];
   today: string;
+  prLog?: any[];
+  workoutEntries?: any[];
   onDayClick: (mesoId: string, micId: string, day: DayEntry) => void;
   onAddMacro: () => void;
   onAddMeso: (macroId?: string) => void;
@@ -166,6 +171,8 @@ export const PeriodisationSettingsView: React.FC<PeriodisationSettingsViewProps>
   macrocycles,
   mesocycles,
   today,
+  prLog,
+  workoutEntries,
   onDayClick,
   onAddMacro,
   onAddMeso,
@@ -184,6 +191,8 @@ export const PeriodisationSettingsView: React.FC<PeriodisationSettingsViewProps>
   const [selectedMesoId, setSelectedMesoId] = useState<string | null>(null);
   const [selectionLevel, setSelectionLevel] = useState<'none' | 'macrocycle' | 'mesocycle'>('mesocycle');
   const [activeSubTab, setActiveSubTab] = useState<'planner' | 'analytics'>('planner');
+  const [showAISettings, setShowAISettings] = useState<boolean>(false);
+  const [isDraftingAIStrategy, setIsDraftingAIStrategy] = useState<boolean>(false);
 
   // Date-synced status calculation
   const getPhaseStatus = (start: string, end: string) => {
@@ -1701,6 +1710,30 @@ export const PeriodisationSettingsView: React.FC<PeriodisationSettingsViewProps>
                 <span className="tab-text-full">Analysis & Graphs</span>
                 <span className="tab-text-short">Graphs</span>
               </button>
+              <button
+                type="button"
+                onClick={() => setShowAISettings(true)}
+                style={{
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  gap: '5px',
+                  padding: '5px 11px',
+                  borderRadius: '7px',
+                  fontSize: '11.5px',
+                  fontWeight: 700,
+                  border: '1px solid rgba(139, 92, 246, 0.35)',
+                  cursor: 'pointer',
+                  background: 'linear-gradient(135deg, rgba(139, 92, 246, 0.15), rgba(99, 102, 241, 0.15))',
+                  color: '#c4b5fd',
+                  transition: 'all 0.15s ease',
+                  whiteSpace: 'nowrap',
+                }}
+                title="Configure Gemini API Key & Sports Science AI"
+              >
+                <Sparkles size={12} style={{ color: '#a78bfa' }} />
+                <span className="tab-text-full">AI Coach</span>
+                <span className="tab-text-short">AI</span>
+              </button>
             </div>
 
             {/* Interactive Contextual Action Buttons (only in planner mode) */}
@@ -2349,12 +2382,15 @@ export const PeriodisationSettingsView: React.FC<PeriodisationSettingsViewProps>
           macrocycles={macrocycles}
           mesocycles={mesocycles}
           today={today}
+          prLog={prLog}
+          workoutEntries={workoutEntries}
           controlledLevel={selectionLevel === 'macrocycle' ? 'macrocycle' : 'mesocycle'}
           selectedMacroId={currentMacro?.id || null}
           selectedMesoId={selectionLevel === 'macrocycle' ? null : (activeMeso?.id || null)}
           hideLevelBar={true}
           hideScopeSelect={true}
           onDayClick={onDayClick}
+          onOpenSettings={() => setShowAISettings(true)}
           onSelectMeso={(mesoId) => {
             setSelectedMesoId(mesoId);
             setSelectionLevel('mesocycle');
@@ -3500,7 +3536,60 @@ export const PeriodisationSettingsView: React.FC<PeriodisationSettingsViewProps>
 
               {/* Phase Notes Section in Modal */}
               <div className="field-row">
-                <label className="field-label">Phase Notes & Strategy</label>
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '6px' }}>
+                  <label className="field-label" style={{ margin: 0 }}>Phase Notes & Strategy</label>
+                  <button
+                    type="button"
+                    onClick={async () => {
+                      setIsDraftingAIStrategy(true);
+                      try {
+                        const trainingCtx = buildComprehensiveTrainingContext({
+                          mesocycles: mesocycles as any,
+                          prLog,
+                          workoutEntries,
+                        });
+                        const suggestion = await suggestMesocycleStrategy(
+                          editPhaseKey,
+                          activeMeso?.microcycles?.length || 4,
+                          activeMeso?.notes,
+                          undefined,
+                          trainingCtx
+                        );
+                        if (suggestion.strategyNotes) {
+                          setEditNotes(suggestion.strategyNotes);
+                        }
+                        if (suggestion.suggestedTargets && suggestion.suggestedTargets.length > 0) {
+                          const newTgts = suggestion.suggestedTargets.map((st) => ({
+                            id: `tgt-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+                            exercise: st.exercise,
+                            target: st.target,
+                            completed: false,
+                          }));
+                          setEditTargets((prev) => [...prev, ...newTgts]);
+                        }
+                      } finally {
+                        setIsDraftingAIStrategy(false);
+                      }
+                    }}
+                    disabled={isDraftingAIStrategy}
+                    style={{
+                      background: 'linear-gradient(135deg, rgba(139, 92, 246, 0.2), rgba(99, 102, 241, 0.2))',
+                      border: '1px solid rgba(139, 92, 246, 0.4)',
+                      borderRadius: '6px',
+                      color: '#c4b5fd',
+                      fontSize: '11px',
+                      fontWeight: 600,
+                      padding: '3px 8px',
+                      cursor: isDraftingAIStrategy ? 'not-allowed' : 'pointer',
+                      display: 'inline-flex',
+                      alignItems: 'center',
+                      gap: '4px',
+                    }}
+                  >
+                    <Sparkles size={11} className={isDraftingAIStrategy ? 'spin-anim' : ''} />
+                    {isDraftingAIStrategy ? 'Drafting...' : 'AI Suggest Strategy'}
+                  </button>
+                </div>
                 <textarea
                   className="text-input"
                   rows={3}
@@ -3519,6 +3608,12 @@ export const PeriodisationSettingsView: React.FC<PeriodisationSettingsViewProps>
           </div>
         </div>
       )}
+
+      {/* AI Coach Intelligence Configuration Modal */}
+      <AISettingsModal
+        isOpen={showAISettings}
+        onClose={() => setShowAISettings(false)}
+      />
     </div>
   );
 };

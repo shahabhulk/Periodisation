@@ -6,8 +6,13 @@ import { ProfileView } from "./components/ProfileView";
 import { TimelineFeedView } from "./components/TimelineFeedView";
 import { ExerciseHistoryModal } from "./components/ExerciseHistoryModal";
 import { PeriodisationSettingsView } from "./components/PeriodisationSettingsView";
+import { AICoachCard } from "./components/AICoachCard";
+import { AISessionDesignerModal } from "./components/AISessionDesignerModal";
+import { clearAnalysisCache } from "./services/geminiService";
+import { computeSessionMetrics } from "./services/periodisationMetrics";
 import { Analytics } from "./components/Analytics";
 import { INITIAL_WORKOUT_DATA } from "./data/initialWorkoutData";
+import { hydrateAllMesocyclesWithWorkoutData } from "./services/appDataService";
 import type { WorkoutEntry, PhaseTarget } from "./types/workout";
 import { fetchLyftaExercises } from "./services/lyftaApi";
 import { formatDateDMY, isCardioExercise, calcE1RM, calcRepsFromE1RM, calcWeightFromE1RM } from "./utils/workoutUtils";
@@ -330,7 +335,9 @@ const STORAGE_KEY = "iron-ledger-data";
 
 function useLedgerStore() {
   const [macrocycles, setMacrocycles] = useState<Macrocycle[]>(seedMacrocycles);
-  const [mesocycles, setMesocycles] = useState<Mesocycle[]>(seedMesocycles);
+  const [mesocycles, setMesocycles] = useState<Mesocycle[]>(() =>
+    hydrateAllMesocyclesWithWorkoutData(seedMesocycles(), INITIAL_WORKOUT_DATA)
+  );
   const [prLog, setPrLog] = useState<PREntry[]>(seedPRLog);
   const [loaded, setLoaded] = useState(false);
   const [saveState, setSaveState] = useState<"idle" | "saving" | "saved" | "error">("idle");
@@ -344,17 +351,18 @@ function useLedgerStore() {
         const macros = parsed.macrocycles || seedMacrocycles();
         if (parsed.macrocycles) setMacrocycles(parsed.macrocycles);
         if (parsed.mesocycles) {
-          const healed = healAllMesocycles(parsed.mesocycles, macros);
+          const hydrated = hydrateAllMesocyclesWithWorkoutData<Mesocycle>(parsed.mesocycles as Mesocycle[], INITIAL_WORKOUT_DATA);
+          const healed = healAllMesocycles(hydrated, macros);
           setMesocycles(healed);
         } else {
-          setMesocycles(healAllMesocycles(seedMesocycles(), macros));
+          setMesocycles(healAllMesocycles(hydrateAllMesocyclesWithWorkoutData(seedMesocycles(), INITIAL_WORKOUT_DATA), macros));
         }
         if (parsed.prLog) setPrLog(parsed.prLog);
       } else {
-        setMesocycles(healAllMesocycles(seedMesocycles(), seedMacrocycles()));
+        setMesocycles(healAllMesocycles(hydrateAllMesocyclesWithWorkoutData(seedMesocycles(), INITIAL_WORKOUT_DATA), seedMacrocycles()));
       }
     } catch {
-      setMesocycles(healAllMesocycles(seedMesocycles(), seedMacrocycles()));
+      setMesocycles(healAllMesocycles(hydrateAllMesocyclesWithWorkoutData(seedMesocycles(), INITIAL_WORKOUT_DATA), seedMacrocycles()));
     } finally {
       setLoaded(true);
     }
@@ -1370,12 +1378,42 @@ function LiftRowItem({ l, updateLift, removeLift, onOpenSetTypeModal, onOpenExer
 
 
 
-function DayModal({ day, phaseColor, onClose, onSave, onDelete, onDiscard, onUpdateDraft, onGoToExerciseLibrary, onPerformAgain, initialEditMode = false, isLive = false, onOpenExerciseHistory }: {
-  day: DayEntry; phaseColor: string; onClose: () => void; onSave: (d: DayEntry) => void; onDelete: (id: string) => void; onDiscard?: () => void; onUpdateDraft: (d: DayEntry) => void; onGoToExerciseLibrary: () => void;
+function DayModal({
+  day,
+  phaseColor,
+  onClose,
+  onSave,
+  onDelete,
+  onDiscard,
+  onUpdateDraft,
+  onGoToExerciseLibrary,
+  onPerformAgain,
+  initialEditMode = false,
+  isLive = false,
+  onOpenExerciseHistory,
+  previousWorkouts = [],
+  currentPhase = "Hypertrophy",
+  allMesocycles = [],
+  allPrs = [],
+  workoutEntries = [],
+}: {
+  day: DayEntry;
+  phaseColor: string;
+  onClose: () => void;
+  onSave: (d: DayEntry) => void;
+  onDelete: (id: string) => void;
+  onDiscard?: () => void;
+  onUpdateDraft: (d: DayEntry) => void;
+  onGoToExerciseLibrary: () => void;
   onPerformAgain?: (d: DayEntry) => void;
   initialEditMode?: boolean;
   isLive?: boolean;
   onOpenExerciseHistory?: (name: string, gifUrl?: string) => void;
+  previousWorkouts?: DayEntry[];
+  currentPhase?: string;
+  allMesocycles?: Mesocycle[];
+  allPrs?: PREntry[];
+  workoutEntries?: WorkoutEntry[];
 }) {
   const [type, setType] = useState(day.type === "empty" ? "workout" : day.type);
   const [title, setTitle] = useState(day.title);
@@ -1395,6 +1433,7 @@ function DayModal({ day, phaseColor, onClose, onSave, onDelete, onDiscard, onUpd
   const [isFavorite, setIsFavorite] = useState(false);
   const [shareToast, setShareToast] = useState(false);
   const [showDiscardConfirm, setShowDiscardConfirm] = useState(false);
+  const [showAIDesigner, setShowAIDesigner] = useState(false);
 
   useEffect(() => {
     setType(day.type === "empty" ? "workout" : day.type);
@@ -1610,6 +1649,31 @@ function DayModal({ day, phaseColor, onClose, onSave, onDelete, onDiscard, onUpd
             </div>
 
             <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+              {/* AI Session Designer Button */}
+              <button
+                type="button"
+                className="ai-design-session-btn"
+                onClick={() => setShowAIDesigner(true)}
+                title="AI Session Designer — Build tailored workout from previous sessions"
+                style={{
+                  display: "inline-flex",
+                  alignItems: "center",
+                  gap: "5px",
+                  padding: "5px 10px",
+                  borderRadius: "8px",
+                  background: "linear-gradient(135deg, rgba(139, 92, 246, 0.28) 0%, rgba(236, 72, 153, 0.28) 100%)",
+                  border: "1px solid rgba(139, 92, 246, 0.45)",
+                  color: "#f1f5f9",
+                  fontSize: "11.5px",
+                  fontWeight: 700,
+                  cursor: "pointer",
+                  boxShadow: "0 2px 8px rgba(139, 92, 246, 0.25)",
+                }}
+              >
+                <Sparkles size={13} style={{ color: "#c4b5fd" }} />
+                <span>AI Design</span>
+              </button>
+
               {/* 3-dots Menu Button ':' */}
               <button
                 type="button"
@@ -1830,6 +1894,31 @@ function DayModal({ day, phaseColor, onClose, onSave, onDelete, onDiscard, onUpd
                     </div>
                   </div>
                 )}
+
+                {/* AI Session Analysis & Debrief */}
+                {type === "workout" && lifts.length > 0 && (
+                  <AICoachCard
+                    level="session"
+                    targetId={day.id}
+                    targetName={title || day.title || "Workout Session"}
+                    metrics={computeSessionMetrics({
+                      ...day,
+                      type,
+                      title,
+                      lifts,
+                      notes,
+                      durationSeconds: elapsedSeconds,
+                    })}
+                    allMesocycles={allMesocycles}
+                    allPrs={allPrs}
+                    workoutEntries={workoutEntries}
+                    meta={{
+                      dietNote: (day as any).diet,
+                      statusNote: notes || (day as any).status,
+                    }}
+                    defaultExpanded={false}
+                  />
+                )}
               </div>
             ) : (
               /* Editable Form */
@@ -1956,7 +2045,25 @@ function DayModal({ day, phaseColor, onClose, onSave, onDelete, onDiscard, onUpd
                           />
                         ))}
 
-                        <button className="add-lift-btn" type="button" onClick={handleAddLiftClick}>+ Add lift</button>
+                        <div style={{ display: "flex", gap: "8px", flexWrap: "wrap", alignItems: "center" }}>
+                          <button className="add-lift-btn" type="button" onClick={handleAddLiftClick}>+ Add lift</button>
+                          <button
+                            type="button"
+                            className="add-lift-btn"
+                            onClick={() => setShowAIDesigner(true)}
+                            style={{
+                              borderColor: "rgba(139, 92, 246, 0.45)",
+                              color: "#c4b5fd",
+                              background: "rgba(139, 92, 246, 0.12)",
+                              display: "inline-flex",
+                              alignItems: "center",
+                              gap: "5px",
+                            }}
+                          >
+                            <Sparkles size={13} />
+                            <span>AI Design Session</span>
+                          </button>
+                        </div>
                       </div>
                     </div>
                   </>
@@ -2399,6 +2506,26 @@ function DayModal({ day, phaseColor, onClose, onSave, onDelete, onDiscard, onUpd
           </div>
         </div>
       )}
+
+      {/* AI Session Designer Modal */}
+      {showAIDesigner && (
+        <AISessionDesignerModal
+          isOpen={showAIDesigner}
+          onClose={() => setShowAIDesigner(false)}
+          previousWorkouts={previousWorkouts}
+          currentPhase={currentPhase}
+          onApplyWorkout={(designed) => {
+            setTitle(designed.title);
+            setBodyTags(designed.bodyTags);
+            setLifts(designed.lifts);
+            if (designed.notes) {
+              setNotes((prev) => (prev ? `${prev}\n\n${designed.notes}` : designed.notes));
+            }
+            setType("workout");
+            setIsEditMode(true);
+          }}
+        />
+      )}
     </>
   );
 }
@@ -2635,7 +2762,26 @@ export default function IronLedger() {
   const [addingMesoMacroId, setAddingMesoMacroId] = useState<string | null>(null);
   const [addingMacro, setAddingMacro] = useState(false);
   const [activeTab, setActiveTab] = useState<TabType>('home');
-  const [workoutEntries, setWorkoutEntries] = useState<WorkoutEntry[]>(INITIAL_WORKOUT_DATA);
+  const [workoutEntries, setWorkoutEntries] = useState<WorkoutEntry[]>(() => {
+    try {
+      const stored = localStorage.getItem("iron_workout_entries");
+      if (stored) {
+        const parsed = JSON.parse(stored);
+        if (Array.isArray(parsed) && parsed.length > 0) return parsed;
+      }
+    } catch (e) {
+      console.warn("Could not load stored workout entries", e);
+    }
+    return INITIAL_WORKOUT_DATA;
+  });
+
+  useEffect(() => {
+    try {
+      localStorage.setItem("iron_workout_entries", JSON.stringify(workoutEntries));
+    } catch (e) {
+      console.warn("Could not save workout entries", e);
+    }
+  }, [workoutEntries]);
   const [isDayModalMinimized, setIsDayModalMinimized] = useState(false);
   const [showResumeDiscardPrompt, setShowResumeDiscardPrompt] = useState(false);
   const [isNavDrawerOpen, setIsNavDrawerOpen] = useState(false);
@@ -2647,6 +2793,15 @@ export default function IronLedger() {
     const active = mesocycles.find((m) => m.status === "active");
     setSelectedId(active ? active.id : mesocycles[mesocycles.length - 1]?.id || null);
   }, [loaded, mesocycles, selectedId]);
+
+  useEffect(() => {
+    // Flush stale academic cache once so all periodisation reports reload in plain layman terms
+    const flushedKey = 'ai_cache_layman_flushed_v2';
+    if (!localStorage.getItem(flushedKey)) {
+      clearAnalysisCache();
+      localStorage.setItem(flushedKey, 'true');
+    }
+  }, []);
 
   const selectedMeso = mesocycles.find((m) => m.id === selectedId) || null;
 
@@ -4196,6 +4351,8 @@ export default function IronLedger() {
           macrocycles={macrocycles}
           mesocycles={mesocycles}
           today={today}
+          prLog={prLog}
+          workoutEntries={workoutEntries}
           onDayClick={(mesoId, micId, day) => openDay(mesoId, micId, day)}
           onAddMacro={() => setAddingMacro(true)}
           onAddMeso={(macroId) => {
@@ -4246,35 +4403,48 @@ export default function IronLedger() {
         />
       )}
 
-      {activeDay && selectedMeso && !isDayModalMinimized && (
-        <DayModal
-          day={activeDay.day}
-          phaseColor={PHASES[selectedMeso.phaseKey]?.color || "#C1432E"}
-          initialEditMode={activeDay.initialEditMode}
-          isLive={Boolean(activeDay.isLive)}
-          onClose={handleDiscardWorkout}
-          onDiscard={handleDiscardWorkout}
-          onSave={(updatedDay) => {
-            saveDay(updatedDay);
-          }}
-          onDelete={(dayId) => {
-            clearDay(dayId);
-            setActiveDay(null);
-            setLiveWorkout(null);
-            setIsDayModalMinimized(false);
-          }}
-          onUpdateDraft={(updatedDay) => {
-            updateDayDraft(updatedDay);
-          }}
-          onGoToExerciseLibrary={() => {
-            setIsDayModalMinimized(true);
-            setActiveTab('exercises');
-            setActiveDay((prev) => prev ? { ...prev, initialEditMode: true } : null);
-          }}
-          onPerformAgain={(d) => handlePerformAgain(d)}
-          onOpenExerciseHistory={(name, gifUrl) => setViewingHistoryExercise({ name, gifUrl })}
-        />
-      )}
+      {activeDay && selectedMeso && !isDayModalMinimized && (() => {
+        const previousWorkoutsList = (mesocycles || []).flatMap((m) =>
+          (m.microcycles || []).flatMap((mc) =>
+            (mc.days || []).filter((d) => d.type === 'workout' && d.id !== activeDay?.day?.id && d.lifts && d.lifts.length > 0)
+          )
+        ).sort((a, b) => (b.date || '').localeCompare(a.date || '')).slice(0, 10);
+
+        return (
+          <DayModal
+            day={activeDay.day}
+            phaseColor={PHASES[selectedMeso.phaseKey]?.color || "#C1432E"}
+            initialEditMode={activeDay.initialEditMode}
+            isLive={Boolean(activeDay.isLive)}
+            previousWorkouts={previousWorkoutsList}
+            currentPhase={selectedMeso.phaseKey}
+            allMesocycles={mesocycles}
+            allPrs={prLog}
+            workoutEntries={workoutEntries}
+            onClose={handleDiscardWorkout}
+            onDiscard={handleDiscardWorkout}
+            onSave={(updatedDay) => {
+              saveDay(updatedDay);
+            }}
+            onDelete={(dayId) => {
+              clearDay(dayId);
+              setActiveDay(null);
+              setLiveWorkout(null);
+              setIsDayModalMinimized(false);
+            }}
+            onUpdateDraft={(updatedDay) => {
+              updateDayDraft(updatedDay);
+            }}
+            onGoToExerciseLibrary={() => {
+              setIsDayModalMinimized(true);
+              setActiveTab('exercises');
+              setActiveDay((prev) => prev ? { ...prev, initialEditMode: true } : null);
+            }}
+            onPerformAgain={(d) => handlePerformAgain(d)}
+            onOpenExerciseHistory={(name, gifUrl) => setViewingHistoryExercise({ name, gifUrl })}
+          />
+        );
+      })()}
 
       {showResumeDiscardPrompt && liveWorkout && (
         <ResumeOrDiscardModal

@@ -13,6 +13,12 @@ import {
   Target,
 } from 'lucide-react';
 import { formatDateDMY } from '../utils/workoutUtils';
+import { AICoachCard } from './AICoachCard';
+import {
+  computeMacrocycleMetrics,
+  computeMesocycleMetrics,
+  computeMicrocycleMetrics,
+} from '../services/periodisationMetrics';
 
 export interface SetEntry {
   id: string;
@@ -77,6 +83,8 @@ export interface PeriodisationAnalysisViewProps {
   macrocycles: Macrocycle[];
   mesocycles: Mesocycle[];
   today: string;
+  prLog?: any[];
+  workoutEntries?: any[];
   initialLevel?: 'macrocycle' | 'mesocycle' | 'microcycle';
   controlledLevel?: 'macrocycle' | 'mesocycle' | 'microcycle';
   selectedMacroId?: string | null;
@@ -88,6 +96,7 @@ export interface PeriodisationAnalysisViewProps {
   onDayClick?: (mesoId: string, micId: string, day: any) => void;
   onSelectMeso?: (mesoId: string) => void;
   onSelectMacro?: (macroId: string) => void;
+  onOpenSettings?: () => void;
 }
 
 const PHASE_COLORS: Record<string, string> = {
@@ -306,6 +315,8 @@ export const PeriodisationAnalysisView: React.FC<PeriodisationAnalysisViewProps>
   macrocycles,
   mesocycles,
   today,
+  prLog,
+  workoutEntries,
   initialLevel = 'mesocycle',
   controlledLevel,
   selectedMacroId: propMacroId,
@@ -317,6 +328,7 @@ export const PeriodisationAnalysisView: React.FC<PeriodisationAnalysisViewProps>
   onDayClick,
   onSelectMeso,
   onSelectMacro,
+  onOpenSettings,
 }) => {
   // Navigation level: Macrocycle vs Mesocycle vs Microcycle
   const [level, setLevel] = useState<'macrocycle' | 'mesocycle' | 'microcycle'>(
@@ -590,6 +602,22 @@ export const PeriodisationAnalysisView: React.FC<PeriodisationAnalysisViewProps>
       maxDayStrength,
     };
   }, [currentMicrocycle, today, selectedLift, equipmentFilter]);
+
+  // Memoized Metrics for AI Periodisation Engine (Filtered by Selected Lift)
+  const macroAICalculatedMetrics = useMemo(() => {
+    if (!currentMacro) return null;
+    return computeMacrocycleMetrics(currentMacro, mesocycles, selectedLift);
+  }, [currentMacro, mesocycles, selectedLift]);
+
+  const mesoAICalculatedMetrics = useMemo(() => {
+    if (!currentMeso) return null;
+    return computeMesocycleMetrics(currentMeso, undefined, selectedLift);
+  }, [currentMeso, selectedLift]);
+
+  const microAICalculatedMetrics = useMemo(() => {
+    if (!currentMicrocycle) return null;
+    return computeMicrocycleMetrics(currentMicrocycle, undefined, selectedLift);
+  }, [currentMicrocycle, selectedLift]);
 
   const liftLabel = selectedLift === 'all' ? 'All Lifts' : selectedLift;
 
@@ -1227,6 +1255,25 @@ export const PeriodisationAnalysisView: React.FC<PeriodisationAnalysisViewProps>
           ============================================================ */}
       {level === 'macrocycle' && macrocycleAnalysis && (
         <>
+          {/* AI Coach Card for Macrocycle */}
+          {currentMacro && macroAICalculatedMetrics && (
+            <AICoachCard
+              level="macrocycle"
+              targetId={`${currentMacro.id}_${selectedLift}_${equipmentFilter}`}
+              targetName={selectedLift !== 'all' ? `${selectedLift} · ${currentMacro.name}` : currentMacro.name}
+              selectedLift={selectedLift}
+              metrics={macroAICalculatedMetrics}
+              allMesocycles={mesocycles}
+              allPrs={prLog}
+              workoutEntries={workoutEntries}
+              meta={{
+                selectedLift,
+                equipmentFilter,
+              }}
+              onOpenSettings={onOpenSettings}
+            />
+          )}
+
           {/* Macrocycle KPIs */}
           <div className="analytics-kpi-grid">
             <div className="kpi-card" style={{ borderLeft: '3px solid #38bdf8' }}>
@@ -1788,6 +1835,28 @@ export const PeriodisationAnalysisView: React.FC<PeriodisationAnalysisViewProps>
           ============================================================ */}
       {level === 'mesocycle' && mesocycleAnalysis && (
         <>
+          {/* AI Coach Card for Mesocycle */}
+          {currentMeso && mesoAICalculatedMetrics && (
+            <AICoachCard
+              level="mesocycle"
+              targetId={`${currentMeso.id}_${selectedLift}_${equipmentFilter}`}
+              targetName={selectedLift !== 'all' ? `${selectedLift} · ${currentMeso.name}` : currentMeso.name}
+              selectedLift={selectedLift}
+              metrics={mesoAICalculatedMetrics}
+              allMesocycles={mesocycles}
+              allPrs={prLog}
+              workoutEntries={workoutEntries}
+              meta={{
+                phaseKey: currentMeso.phaseKey,
+                strategyNotes: currentMeso.notes,
+                targets: currentMeso.targets,
+                selectedLift,
+                equipmentFilter,
+              }}
+              onOpenSettings={onOpenSettings}
+            />
+          )}
+
           {/* Mesocycle KPIs */}
           <div className="analytics-kpi-grid">
             <div className="kpi-card" style={{ borderLeft: '3px solid #f43f5e' }}>
@@ -2504,6 +2573,27 @@ export const PeriodisationAnalysisView: React.FC<PeriodisationAnalysisViewProps>
               ))}
             </div>
           </div>
+
+          {/* AI Coach Card for Microcycle */}
+          {currentMicrocycle && microAICalculatedMetrics && (
+            <AICoachCard
+              level="microcycle"
+              targetId={`${currentMicrocycle.id}_${selectedLift}_${equipmentFilter}`}
+              targetName={selectedLift !== 'all' ? `${selectedLift} · ${currentMicrocycle.label || `Microcycle ${currentMicrocycle.index}`}` : (currentMicrocycle.label || `Microcycle ${currentMicrocycle.index}`)}
+              selectedLift={selectedLift}
+              metrics={microAICalculatedMetrics}
+              allMesocycles={mesocycles}
+              allPrs={prLog}
+              workoutEntries={workoutEntries}
+              meta={{
+                phaseKey: currentMeso?.phaseKey,
+                strategyNotes: currentMicrocycle.note,
+                selectedLift,
+                equipmentFilter,
+              }}
+              onOpenSettings={onOpenSettings}
+            />
+          )}
 
           {/* Microcycle KPIs */}
           <div className="analytics-kpi-grid">
